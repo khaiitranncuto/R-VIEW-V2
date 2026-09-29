@@ -1,0 +1,11 @@
+Flask
+google-genai
+edge-tts
+imageio-ffmpeg
+numpy
+scenedetect
+Pillow
+
+# Optional semantic scene matching (large dependencies):
+# torch
+# transformers

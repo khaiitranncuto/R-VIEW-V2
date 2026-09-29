@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Cartoon & Meme Video Generator</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom Style Sheet -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+
+    <div class="app-container">
+        <!-- Top Navigation / Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="brand-icon">
+                    <i class="fa-solid fa-image"></i>
+                </div>
+                <div>
+                    <h1>AI Cartoon/Meme Video <span class="text-gradient">Generator</span></h1>
+                    <p class="brand-subtitle">Tự động tạo video hình ảnh AI từ kịch bản văn bản</p>
+                </div>
+            </div>
+            <div class="header-actions" style="display: flex; gap: 15px; align-items: center;">
+                <a href="/" class="btn btn-outline-cyan"><i class="fa-solid fa-arrow-left"></i> Về Chế Độ Review Phim</a>
+                <div class="api-status-badge" id="api-status-badge">
+                    <span class="indicator red"></span>
+                    <span class="status-text">Chưa xác thực API</span>
+                </div>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <section class="wizard-panel active">
+                <div class="grid-2col gap-6">
+                    <!-- Left: Configuration -->
+                    <div class="flex-column gap-4">
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-key"></i> Gemini API (Dùng cho vẽ ảnh)</h3>
+                            <div class="form-group">
+                                <div class="input-with-icon">
+                                    <i class="fa-solid fa-lock"></i>
+                                    <input type="password" id="api-key-input" value="{{ default_key }}" placeholder="Nhập Gemini API Key của bạn...">
+                                    <button type="button" class="btn-toggle-pass" id="btn-toggle-api-key"><i class="fa-solid fa-eye"></i></button>
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-verify w-100" id="btn-verify-api">
+                                <i class="fa-solid fa-circle-check"></i> Xác Thực Kết Nối API
+                            </button>
+                        </div>
+                        
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-pen-nib"></i> Kịch Bản & Phong Cách Ảnh</h3>
+                            <div class="form-group">
+                                <label for="script-text">Kịch bản (Mỗi câu sẽ vẽ 1 ảnh tương ứng):</label>
+                                <textarea id="script-text" rows="6" placeholder="Một ngày nọ, chàng trai thức dậy...
+Anh nhận ra mình có siêu năng lực...
+..."></textarea>
+                            </div>
+                            <div class="form-group mt-3">
+                                <label for="style-prompt">Phong cách vẽ (Prompt tiếng Việt/Anh):</label>
+                                <input type="text" id="style-prompt" value="Vẽ người que, nền trắng đen đơn giản, comic style" placeholder="Ví dụ: Vẽ người que trắng đen">
+                                <div class="subtitle-presets mt-2">
+                                    <button type="button" class="preset-chip style-chip" data-style="Vẽ người que, nền trắng đen đơn giản, comic style">Người Que</button>
+                                    <button type="button" class="preset-chip style-chip" data-style="Cartoon style, colorful, cute characters, meme style">Học Viện Bò/Gấu</button>
+                                    <button type="button" class="preset-chip style-chip" data-style="Cinematic, realistic, 4k, hyper detailed">Điện Ảnh</button>
+                                    <button type="button" class="preset-chip style-chip" data-style="Anime style, Studio Ghibli, beautiful landscape">Anime</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-sliders"></i> Cấu Hình Xuất Video</h3>
+                            <div class="grid-2col gap-4">
+                                <div class="form-group">
+                                    <label for="aspect-ratio">Khung hình:</label>
+                                    <select id="aspect-ratio">
+                                        <option value="16:9" selected>Ngang (16:9 - YouTube)</option>
+                                        <option value="9:16">Dọc (9:16 - TikTok/Shorts)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="voice-select">Giọng đọc AI:</label>
+                                    <select id="voice-select">
+                                        <optgroup label="🇻🇳 Giọng Việt Nam">
+                                            <option value="vi-VN-HoaiMyNeural" selected>Hoài Mỹ (Nữ - Mượt mà)</option>
+                                            <option value="vi-VN-NamMinhNeural">Nam Minh (Nam - Kịch tính)</option>
+                                        </optgroup>
+                                        <optgroup label="🌐 Giọng Đa Ngôn Ngữ (Hot trên YouTube)">
+                                            <option value="en-US-AndrewMultilingualNeural">Andrew (Nam - Trầm ấm)</option>
+                                            <option value="en-US-BrianMultilingualNeural">Brian (Nam - Mạnh mẽ)</option>
+                                            <option value="en-US-AvaMultilingualNeural">Ava (Nữ - Trong trẻo)</option>
+                                            <option value="en-US-EmmaMultilingualNeural">Emma (Nữ - Dịu dàng)</option>
+                                            <option value="ko-KR-HyunsuMultilingualNeural">Hyunsu (Nam - Trẻ trung)</option>
+                                        </optgroup>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group mt-4">
+                                <label><i class="fa-solid fa-folder-open"></i> Thư mục xuất tự động:</label>
+                                <div class="flex-between" style="gap: 10px;">
+                                    <input id="export-directory-display" class="w-100" type="text" readonly placeholder="Chưa chọn — file vẫn nằm trong thư mục output của tool">
+                                    <button type="button" class="btn btn-secondary" id="btn-choose-export-directory"><i class="fa-solid fa-folder-tree"></i> Chọn</button>
+                                </div>
+                                <small>Thư mục này được lưu và dùng tự động cho các lần xuất sau.</small>
+                            </div>
+
+                            <button type="button" class="btn btn-primary btn-lg w-100 mt-4 py-3" id="btn-start-render">
+                                <i class="fa-solid fa-circle-play"></i> BẮT ĐẦU TẠO VIDEO AI
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Right: Progress & Output -->
+                    <div class="card glass flex-column align-center justify-center p-6">
+                        <!-- Progress state -->
+                        <div class="render-progress-box w-100 hidden" id="render-progress-box" style="margin-bottom: 20px;">
+                            <div class="flex-between mb-2">
+                                <span class="status-lbl" id="render-status-lbl">Đang xếp hàng...</span>
+                                <div class="render-meta">
+                                    <span class="status-percent" id="render-status-percent">0%</span>
+                                </div>
+                            </div>
+                            <div class="progress-bar-container">
+                                <div class="loading-progress-fill" id="render-progress-fill" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Video Output -->
+                        <div class="video-preview-placeholder" id="video-preview-placeholder">
+                            <i class="fa-solid fa-film placeholder-icon"></i>
+                            <p class="placeholder-title">Video Hoạt Hình sẽ hiển thị tại đây</p>
+                            <ul class="placeholder-tips">
+                                <li><i class="fa-solid fa-check text-green"></i> Kịch bản tự động chia câu</li>
+                                <li><i class="fa-solid fa-check text-green"></i> Tự động vẽ ảnh tương ứng với từng câu</li>
+                                <li><i class="fa-solid fa-check text-green"></i> Ghép audio và hình ảnh thành phim</li>
+                            </ul>
+                        </div>
+                        
+                        <div class="video-preview-wrapper hidden" id="video-preview-wrapper" style="width: 100%;">
+                            <video id="final-video-player" controls width="100%" class="final-video">
+                                <source src="" type="video/mp4">
+                            </video>
+                            <a href="" download class="btn btn-success btn-lg w-100 mt-4 download-btn-glow" id="btn-download-video">
+                                <i class="fa-solid fa-circle-down"></i> TẢI VIDEO MP4
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    
+    <div class="toast-container" id="toast-container"></div>
+    <script src="/static/js/ai_video.js"></script>
+</body>
+</html>

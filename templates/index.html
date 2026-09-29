@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Movie Review Master - Công Cụ Review Phim Đỉnh Cao</title>
+    <!-- Google Fonts: Plus Jakarta Sans & Space Grotesk -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Premium Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom Style Sheet -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Background Blur Decorative Blobs -->
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+
+    <div class="app-container">
+        <!-- Top Navigation / Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="brand-icon">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                </div>
+                <div>
+                    <h1>AI Movie Review <span class="text-gradient">Master</span> <span class="version-badge">v2.0</span></h1>
+                    <p class="brand-subtitle">Thiết kế video review phim chuyên nghiệp trong vài cú click</p>
+                </div>
+            </div>
+            <div class="header-actions" style="display: flex; gap: 15px; align-items: center;">
+                <a href="/ai-video" class="btn btn-outline-cyan"><i class="fa-solid fa-image"></i> Tạo Video Hoạt Hình AI</a>
+                <div class="api-status-badge" id="api-status-badge">
+                    <span class="indicator red"></span>
+                    <span class="status-text">Chưa xác thực API</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Stepper Navigation -->
+        <div class="stepper">
+            <div class="step active" data-step="1">
+                <div class="step-num"><i class="fa-solid fa-gear"></i></div>
+                <div class="step-label">Cài Đặt & Video</div>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" data-step="2">
+                <div class="step-num"><i class="fa-solid fa-pen-nib"></i></div>
+                <div class="step-label">Kịch Bản AI</div>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" data-step="3">
+                <div class="step-num"><i class="fa-solid fa-microphone"></i></div>
+                <div class="step-label">Lồng Tiếng</div>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" data-step="4">
+                <div class="step-num"><i class="fa-solid fa-sliders"></i></div>
+                <div class="step-label">Nhạc & Bộ Lọc</div>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" data-step="5">
+                <div class="step-num"><i class="fa-solid fa-download"></i></div>
+                <div class="step-label">Xuất Video</div>
+            </div>
+        </div>
+
+        <!-- Main Wizard Content -->
+        <main class="main-content">
+
+            <!-- ================= STEP 1: API & VIDEO SETUP ================= -->
+            <section class="wizard-panel active" id="panel-1">
+                <div class="panel-header">
+                    <h2 class="section-title"><i class="fa-solid fa-sliders text-gradient-icon"></i> Cài Đặt Hệ Thống & Video Gốc</h2>
+                    <p class="panel-desc">Nhập khóa Gemini API và chọn video bạn muốn review</p>
+                </div>
+
+                <div class="grid-2col">
+                    <!-- Left: API Config -->
+                    <div class="card glass card-accent-purple">
+                        <div class="card-header-accent">
+                            <div class="card-icon-circle purple">
+                                <i class="fa-solid fa-key"></i>
+                            </div>
+                            <div>
+                                <h3 class="card-title m-0">Gemini API Configuration</h3>
+                                <p class="card-subtitle">Kết nối với Google AI để phân tích video</p>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="api-key-input">Gemini API Key</label>
+                            <div class="input-with-icon">
+                                <i class="fa-solid fa-lock"></i>
+                                <input type="password" id="api-key-input" value="{{ default_key }}" placeholder="Nhập Gemini API Key của bạn...">
+                                <button type="button" class="btn-toggle-pass" id="btn-toggle-api-key"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="model-select">Chọn Mô Hình AI</label>
+                            <div class="input-with-icon">
+                                <i class="fa-solid fa-brain"></i>
+                                <select id="model-select">
+                                    <option value="gemini-2.0-flash" selected>Gemini 2.0 Flash (Ổn định - Khuyên dùng)</option>
+                                    <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite (Nhẹ, nhanh)</option>
+                                    <option value="gemini-1.5-flash">Gemini 1.5 Flash (Rất ổn định)</option>
+                                    <option value="gemini-1.5-pro">Gemini 1.5 Pro (Thông minh, phân tích sâu)</option>
+                                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (Mới nhất, có thể chậm)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-verify w-100" id="btn-verify-api">
+                            <i class="fa-solid fa-circle-check"></i> Xác Thực Kết Nối API
+                        </button>
+                    </div>
+
+                    <!-- Right: Video Selection -->
+                    <div class="card glass card-accent-cyan">
+                        <div class="card-header-accent">
+                            <div class="card-icon-circle cyan">
+                                <i class="fa-solid fa-video"></i>
+                            </div>
+                            <div>
+                                <h3 class="card-title m-0">Chọn Video Gốc</h3>
+                                <p class="card-subtitle">Video phim bạn muốn tạo review</p>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="video-select">Chọn video có sẵn trong thư mục dự án</label>
+                            <div class="input-with-icon">
+                                <i class="fa-solid fa-folder-open"></i>
+                                <select id="video-select">
+                                    <option value="" disabled selected>Đang tải danh sách video...</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="divider"><span>Hoặc tải lên video mới</span></div>
+
+                        <div class="file-drop-zone" id="video-drop-zone">
+                            <div class="drop-icon-wrapper">
+                                <i class="fa-solid fa-cloud-arrow-up drop-icon"></i>
+                                <div class="drop-icon-ring"></div>
+                            </div>
+                            <p class="drop-text">Kéo thả tệp video vào đây hoặc <span class="browse-link">Chọn tệp</span></p>
+                            <p class="drop-hint">Hỗ trợ MP4, MKV, AVI, MOV, WebM</p>
+                            <input type="file" id="video-file-input" accept="video/*" class="hidden-input">
+                        </div>
+                        <div class="upload-progress-bar hidden" id="video-upload-progress">
+                            <div class="progress-fill"></div>
+                            <span class="progress-percent">0%</span>
+                        </div>
+                        
+                        <div class="aspect-ratio-container" style="margin-top: 20px;">
+                            <label style="font-weight: 600; margin-bottom: 8px; display: block; color: #fff;">Định dạng Video đầu ra:</label>
+                            <div class="ratio-options" style="display: flex; gap: 12px;">
+                                <label class="ratio-card" style="flex: 1; border: 1px solid #444; border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; background: rgba(255, 255, 255, 0.05);" onclick="document.querySelectorAll('.ratio-card').forEach(c => {c.style.borderColor='#444'; c.style.background='rgba(255, 255, 255, 0.05)'}); this.style.borderColor='#3b82f6'; this.style.background='rgba(59, 130, 246, 0.1)';">
+                                    <input type="radio" name="aspect_ratio" value="9:16" style="display: none;">
+                                    <div style="font-weight: bold; color: #fff;">📱 9:16 (Dọc)</div>
+                                    <div style="font-size: 11px; color: #aaa;">TikTok, Shorts, Reels</div>
+                                </label>
+                                <label class="ratio-card" style="flex: 1; border: 2px solid #3b82f6; border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; background: rgba(59, 130, 246, 0.1);" onclick="document.querySelectorAll('.ratio-card').forEach(c => {c.style.borderColor='#444'; c.style.background='rgba(255, 255, 255, 0.05)'}); this.style.borderColor='#3b82f6'; this.style.background='rgba(59, 130, 246, 0.1)';">
+                                    <input type="radio" name="aspect_ratio" value="16:9" checked style="display: none;">
+                                    <div style="font-weight: bold; color: #fff;">🖥️ 16:9 (Ngang)</div>
+                                    <div style="font-size: 11px; color: #aaa;">YouTube Chuẩn</div>
+                                </label>
+                                <label class="ratio-card" style="flex: 1; border: 1px solid #444; border-radius: 8px; padding: 10px; text-align: center; cursor: pointer; background: rgba(255, 255, 255, 0.05);" onclick="document.querySelectorAll('.ratio-card').forEach(c => {c.style.borderColor='#444'; c.style.background='rgba(255, 255, 255, 0.05)'}); this.style.borderColor='#3b82f6'; this.style.background='rgba(59, 130, 246, 0.1)';">
+                                    <input type="radio" name="aspect_ratio" value="1:1" style="display: none;">
+                                    <div style="font-weight: bold; color: #fff;">🔲 1:1 (Vuông)</div>
+                                    <div style="font-size: 11px; color: #aaa;">Facebook, Instagram</div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button type="button" class="btn btn-primary" id="btn-to-step2" disabled>Tiếp tục: Tạo Kịch Bản <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </section>
+
+            <!-- ================= STEP 2: AI SCRIPT GENERATOR ================= -->
+            <section class="wizard-panel" id="panel-2">
+                <div class="panel-header">
+                    <h2 class="section-title"><i class="fa-solid fa-pen-nib text-gradient-icon"></i> Biên Soạn Kịch Bản AI</h2>
+                    <p class="panel-desc">Để Gemini AI xem phim và tạo kịch bản chuyên nghiệp, sau đó chỉnh sửa lại theo ý bạn</p>
+                </div>
+
+                <div class="grid-3-1">
+                    <!-- Left: Prompting and Editor -->
+                    <div class="flex-column gap-4">
+                        <div class="card glass">
+                            <div class="grid-2col gap-4">
+                                <div class="form-group">
+                                    <label for="style-select">Phong Cách Kịch Bản</label>
+                                    <select id="style-select">
+                                        <option value="dramatic" selected>Kịch Tính & Hồi Hộp (Review Phim)</option>
+                                        <option value="humorous">Hài Hước & Dí Dỏm (Bình Luận Phim)</option>
+                                        <option value="shorts">Tóm Tắt Nhanh (TikTok/Shorts/Reels)</option>
+                                        <option value="news">📰 Bản Tin & Điểm Tin (Cập Nhật / News)</option>
+                                        <option value="tutorial">💡 Hướng Dẫn & Review Sâu (Tutorial / How-to)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="custom-prompt">Yêu Cầu Chi Tiết Cho AI</label>
+                                    <textarea id="custom-prompt" rows="2" placeholder="Ví dụ: Tập trung bình luận những biểu cảm sợ hãi của nhân vật, sử dụng từ ngữ kịch tính làm nổi bật sinh tồn hoang dã..."></textarea>
+                                </div>
+                            </div>
+                            
+                            <!-- Multi-voice option -->
+                            <div class="form-group mt-2">
+                                <label class="checkbox-container" title='AI sẽ tự động chia kịch bản thành 2 vai đối thoại (VD: NamMinh & HoaiMy) giúp video review hấp dẫn như phim.'>
+                                    🤹 Kích hoạt "Đa Giọng Đọc" (Tự động tạo hội thoại Nam/Nữ)
+                                    <input type="checkbox" id="enable-multi-voice">
+                                    <span class="checkmark"></span>
+                                </label>
+                            </div>
+                            <button type="button" class="btn btn-primary w-100 py-3 mt-2" id="btn-generate-script">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i> Phân Tích Video & Tạo Kịch Bản Với Gemini
+                            </button>
+                        </div>
+
+                        <!-- Editor Output -->
+                        <div class="card glass editor-card">
+                            <div class="editor-header">
+                                <h3 class="card-title m-0"><i class="fa-solid fa-file-signature"></i> Nội Dung Kịch Bản</h3>
+                                <span class="char-count" id="script-char-count">0 từ</span>
+                            </div>
+                            <textarea id="script-editor" placeholder="Nội dung kịch bản AI tạo ra sẽ hiển thị ở đây. Bạn có thể tự do chỉnh sửa, thêm thắt hoặc sửa tên nhân vật cho chính xác..."></textarea>
+                        </div>
+                    </div>
+
+                    <!-- Right: Info & Prompt Guides -->
+                    <div class="card glass sidebar-card sidebar-tips-upgraded">
+                        <h3 class="card-title"><i class="fa-solid fa-lightbulb text-gradient-icon"></i> Mẹo Viết Kịch Bản</h3>
+                        
+                        <!-- Tip Category 1: Chỉnh sửa -->
+                        <div class="tip-category">
+                            <div class="tip-category-header">
+                                <i class="fa-solid fa-pen-to-square tip-cat-icon purple"></i>
+                                <span>Chỉnh Sửa Kịch Bản</span>
+                            </div>
+                            <ul class="tips-list">
+                                <li><i class="fa-solid fa-circle-check text-green"></i> <strong>Sửa tên nhân vật:</strong> AI hay dịch sai tên — kiểm tra và sửa trước khi lồng tiếng.</li>
+                                <li><i class="fa-solid fa-circle-check text-green"></i> <strong>Câu ngắn gọn:</strong> Mỗi câu nên 10-30 từ. Nhịp nhanh = video hấp dẫn hơn.</li>
+                                <li><i class="fa-solid fa-circle-check text-green"></i> <strong>Bỏ thông tin thừa:</strong> Xóa phần mở đầu, lời chào, giới thiệu kênh nếu AI vẫn viết.</li>
+                            </ul>
+                        </div>
+
+                        <!-- Tip Category 2: Cảm xúc -->
+                        <div class="tip-category">
+                            <div class="tip-category-header">
+                                <i class="fa-solid fa-face-surprise tip-cat-icon cyan"></i>
+                                <span>Tăng Cảm Xúc</span>
+                            </div>
+                            <ul class="tips-list">
+                                <li><i class="fa-solid fa-bolt text-yellow"></i> <strong>Từ cảm thán:</strong> 
+                                    <span class="emotion-tag" data-insert="Hãy dùng từ cảm thán như 'Trời ơi!', 'Không thể tin nổi!' ở đầu các phân cảnh cao trào để tăng sự lôi cuốn.">"Trời ơi!", "Không thể tin nổi!"</span>
+                                </li>
+                                <li><i class="fa-solid fa-question text-blue"></i> <strong>Câu hỏi tu từ:</strong> 
+                                    <span class="emotion-tag" data-insert="Chèn các câu hỏi tu từ như 'Liệu nhân vật có thoát được không?', 'Chuyện gì sẽ xảy ra tiếp theo?' để kích thích sự tò mò của khán giả.">"Liệu anh ta có thoát được không?"</span>
+                                </li>
+                                <li><i class="fa-solid fa-pause text-red"></i> <strong>Ngắt nhịp:</strong> 
+                                    <span class="emotion-tag" data-insert="Sử dụng dấu ba chấm (...) và câu ngắn để tạo khoảng lặng tĩnh mịch trước khi có biến cố.">Thêm dấu "..." giữa câu</span>
+                                </li>
+                            </ul>
+                        </div>
+
+                        <!-- Tip Category 3: Chèn Âm Thanh (SFX) -->
+                        <div class="tip-category">
+                            <div class="tip-category-header">
+                                <i class="fa-solid fa-music tip-cat-icon purple"></i>
+                                <span>Chèn Âm Thanh (SFX)</span>
+                            </div>
+                            <div class="prompt-templates">
+                                <button class="prompt-chip sfx-chip" data-prompt="[SFX=gunshot.mp3]">
+                                    <i class="fa-solid fa-gun"></i> Súng nổ
+                                </button>
+                                <button class="prompt-chip sfx-chip" data-prompt="[SFX=laugh_track.mp3]">
+                                    <i class="fa-solid fa-face-laugh-squint"></i> Cười
+                                </button>
+                                <button class="prompt-chip sfx-chip" data-prompt="[SFX=heartbeat.mp3]">
+                                    <i class="fa-solid fa-heart-pulse"></i> Tim đập
+                                </button>
+                                <button class="prompt-chip sfx-chip" data-prompt="[SFX=punch.mp3]">
+                                    <i class="fa-solid fa-hand-fist"></i> Đấm
+                                </button>
+                                <button class="prompt-chip sfx-chip" data-prompt="[SFX=bruh.mp3]">
+                                    <i class="fa-solid fa-face-rolling-eyes"></i> Bruh
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Tip Category 3: Prompt Templates -->
+                        <div class="tip-category">
+                            <div class="tip-category-header">
+                                <i class="fa-solid fa-wand-magic-sparkles tip-cat-icon green"></i>
+                                <span>Mẫu Prompt Gợi Ý</span>
+                            </div>
+                            <div class="prompt-templates">
+                                <button class="prompt-chip" data-prompt="Tập trung vào diễn biến tâm lý nhân vật chính, phân tích hành động và động cơ ẩn sau mỗi quyết định.">
+                                    <i class="fa-solid fa-brain"></i> Phân tích tâm lý
+                                </button>
+                                <button class="prompt-chip" data-prompt="Kể lại câu chuyện theo trình tự thời gian, nhấn mạnh các bước ngoặt quan trọng và cái kết bất ngờ.">
+                                    <i class="fa-solid fa-timeline"></i> Tóm tắt diễn biến
+                                </button>
+                                <button class="prompt-chip" data-prompt="Bình luận hài hước về những tình huống vô lý trong phim, so sánh với đời thực để người xem bật cười.">
+                                    <i class="fa-solid fa-face-laugh"></i> Bình luận hài
+                                </button>
+                                <button class="prompt-chip" data-prompt="Tạo cảm giác hồi hộp, rùng rợn. Nhấn mạnh yếu tố kinh dị, jump scare, và bầu không khí đáng sợ.">
+                                    <i class="fa-solid fa-ghost"></i> Review kinh dị
+                                </button>
+                                <button class="prompt-chip" data-prompt="Phân tích mối quan hệ giữa các nhân vật, cảm xúc tình cảm, và những khoảnh khắc lãng mạn xúc động.">
+                                    <i class="fa-solid fa-heart"></i> Phim tình cảm
+                                </button>
+                                <button class="prompt-chip" data-prompt="Tập trung vào các pha hành động mãn nhãn, đánh giá kỹ xảo, và so sánh với các phim cùng thể loại.">
+                                    <i class="fa-solid fa-explosion"></i> Phim hành động
+                                </button>
+                            </div>
+                            <p class="prompt-hint"><i class="fa-solid fa-circle-info"></i> Nhấn để điền vào ô "Yêu Cầu Chi Tiết"</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Generating Progress Modal overlay within panel -->
+                <div class="panel-loading-overlay hidden" id="script-gen-loading">
+                    <div class="loader-box">
+                        <div class="glow-spinner"></div>
+                        <h4 id="script-loading-title">Đang kết nối Gemini...</h4>
+                        <div class="progress-bar-container">
+                            <div class="loading-progress-fill" id="script-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <p class="loading-msg" id="script-loading-msg">Đang chuẩn bị gửi video lên máy chủ AI...</p>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button type="button" class="btn btn-secondary btn-back" data-target="1"><i class="fa-solid fa-arrow-left"></i> Quay Lại</button>
+                    <button type="button" class="btn btn-primary" id="btn-to-step3">Tiếp tục: Phân Đoạn & Lồng Tiếng <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </section>
+
+            <!-- ================= STEP 3: SEGMENTATION & TTS ================= -->
+            <section class="wizard-panel" id="panel-3">
+                <div class="panel-header">
+                    <h2 class="section-title"><i class="fa-solid fa-volume-high text-gradient-icon"></i> Phân Phối Cảnh & Thiết Lập Giọng Đọc</h2>
+                    <p class="panel-desc">Kịch bản đã được tách thành các phân cảnh. Chọn giọng đọc AI, tốc độ nói và có thể nghe thử từng câu</p>
+                </div>
+
+                <div class="grid-1-3">
+                    <!-- Left Config -->
+                    <div class="flex-column gap-4">
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-microphone"></i> Cấu Hình Lồng Tiếng</h3>
+                            <div class="form-group">
+                                <label for="voice-select">Giọng Đọc AI (Edge-TTS)</label>
+                                <select id="voice-select">
+                                    <optgroup label="🇻🇳 Giọng Việt Nam">
+                                        <option value="vi-VN-HoaiMyNeural" selected>Hoài Mỹ (Nữ - Mượt mà)</option>
+                                        <option value="vi-VN-NamMinhNeural">Nam Minh (Nam - Kịch tính)</option>
+                                    </optgroup>
+                                    <optgroup label="🌐 Giọng Đa Ngôn Ngữ (Hot trên YouTube)">
+                                        <option value="en-US-AndrewMultilingualNeural">Andrew (Nam - Trầm ấm, kể chuyện)</option>
+                                        <option value="en-US-BrianMultilingualNeural">Brian (Nam - Mạnh mẽ, cuốn hút)</option>
+                                        <option value="en-US-AvaMultilingualNeural">Ava (Nữ - Trong trẻo, tự nhiên)</option>
+                                        <option value="en-US-EmmaMultilingualNeural">Emma (Nữ - Dịu dàng, thu hút)</option>
+                                        <option value="ko-KR-HyunsuMultilingualNeural">Hyunsu (Nam - Trẻ trung, năng động)</option>
+                                    </optgroup>
+                                </select>
+                                <button type="button" id="btn-preview-voice" class="btn btn-sm" style="margin-top:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;padding:8px 18px;border-radius:8px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;transition:all 0.3s;" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+                                    <i class="fa-solid fa-headphones"></i> Nghe thử giọng
+                                </button>
+                                <span id="voice-preview-status" style="margin-left:8px;font-size:12px;color:#a78bfa;display:none;"></span>
+                                <audio id="voice-preview-audio" style="display:none;width:100%;margin-top:8px;height:36px;border-radius:8px;" controls></audio>
+                            </div>
+                            <div class="form-group">
+                                <label for="voice-rate-slider">Tốc độ đọc: <span class="badge-value" id="voice-rate-val">+10%</span></label>
+                                <input type="range" id="voice-rate-slider" min="-20" max="50" step="5" value="10">
+                                <div class="slider-labels">
+                                    <span>Chậm</span>
+                                    <span>Bình thường</span>
+                                    <span>Nhanh</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Stats Card -->
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-chart-bar"></i> Thống Kê Kịch Bản</h3>
+                            <div class="stats-grid">
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-sentence-count">0</div>
+                                    <div class="stat-label">Phân cảnh</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-word-count">0</div>
+                                    <div class="stat-label">Tổng từ</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" id="stat-est-duration">~0p</div>
+                                    <div class="stat-label">Ước tính</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-info-circle"></i> Cách hoạt động</h3>
+                            <ul class="tips-list compact-tips">
+                                <li><i class="fa-solid fa-circle-check text-green"></i> TTS đọc từng câu → tính thời lượng thực tế</li>
+                                <li><i class="fa-solid fa-circle-check text-green"></i> Cắt video gốc theo đúng thời lượng mỗi câu</li>
+                                <li><i class="fa-solid fa-circle-check text-green"></i> Ghép âm thanh + video + phụ đề đồng bộ</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <!-- Right: Sentences List -->
+                    <div class="card glass scrollable-card">
+                        <h3 class="card-title flex-between">
+                            <span><i class="fa-solid fa-list-ol"></i> Phân Đoạn & Subtitles</span>
+                            <div class="sentence-actions-header">
+                                <button type="button" class="btn btn-sm btn-outline-cyan" id="btn-add-sentence"><i class="fa-solid fa-plus"></i> Thêm câu</button>
+                                <button type="button" class="btn btn-sm btn-outline-cyan" id="btn-re-split"><i class="fa-solid fa-arrows-rotate"></i> Tách Lại</button>
+                            </div>
+                        </h3>
+                        
+                        <div class="sentences-container" id="sentences-list">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button type="button" class="btn btn-secondary btn-back" data-target="2"><i class="fa-solid fa-arrow-left"></i> Quay Lại</button>
+                    <button type="button" class="btn btn-primary" id="btn-to-step4">Tiếp tục: Nhạc & Lách Bản Quyền <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </section>
+
+            <!-- ================= STEP 4: MUSIC & FILTERS ================= -->
+            <section class="wizard-panel" id="panel-4">
+                <div class="panel-header">
+                    <h2 class="section-title"><i class="fa-solid fa-photo-film text-gradient-icon"></i> Phối Nhạc Nền & Bộ Lọc Bản Quyền</h2>
+                    <p class="panel-desc">Thêm nhạc nền BGM để tạo cảm xúc và cấu hình các tùy chọn lách bản quyền video</p>
+                </div>
+
+                <div class="grid-2col">
+                    <!-- Left: Background Music -->
+                    <div class="card glass">
+                        <h3 class="card-title"><i class="fa-solid fa-music"></i> Nhạc Nền (Background Music)</h3>
+                        <div class="form-group">
+                            <label for="bgm-select" style="display: flex; justify-content: space-between; align-items: center;">
+                                <span>Chọn nhạc nền từ kho lưu trữ</span>
+                                <button type="button" id="btn-suggest-bgm" class="btn btn-sm" style="background: rgba(0,255,255,0.1); border: 1px solid rgba(0,255,255,0.3); color: var(--text-color); border-radius: 4px; padding: 2px 8px; font-size: 12px; cursor: pointer;">
+                                    <i class="fa-solid fa-lightbulb text-yellow"></i> Gợi ý
+                                </button>
+                            </label>
+                            <div class="input-with-icon">
+                                <i class="fa-solid fa-guitar"></i>
+                                <select id="bgm-select">
+                                    <option value="" selected>Không dùng nhạc nền (Chỉ giữ giọng đọc)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="bgm-volume-slider">Âm lượng nhạc nền: <span class="badge-value" id="bgm-volume-val">12%</span></label>
+                            <input type="range" id="bgm-volume-slider" min="2" max="30" step="1" value="12">
+                            <p class="slider-hint">Khuyên dùng: 10% - 15% để không đè lên giọng nói thuyết minh</p>
+                        </div>
+
+                        <div class="divider"><span>Hoặc tải nhạc nền của riêng bạn</span></div>
+
+                        <div class="file-drop-zone" id="bgm-drop-zone">
+                            <i class="fa-solid fa-file-audio drop-icon"></i>
+                            <p class="drop-text">Kéo thả tệp âm thanh vào đây hoặc <span class="browse-link">Chọn tệp</span></p>
+                            <input type="file" id="bgm-file-input" accept="audio/*" class="hidden-input">
+                        </div>
+                        <div class="upload-progress-bar hidden" id="bgm-upload-progress">
+                            <div class="progress-fill"></div>
+                            <span class="progress-percent">0%</span>
+                        </div>
+                    </div>
+
+                    <!-- Right: Copyright Filters & Subtitle Styles -->
+                    <div class="flex-column gap-4">
+                        <!-- Filters -->
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-shield-halved"></i> Bộ Lọc Lách Bản Quyền (Copyright Bypass)</h3>
+                            
+                            <div class="checkbox-group">
+                                <label class="checkbox-container">
+                                    Lật ngang video (Horizontal Mirror)
+                                    <input type="checkbox" id="filter-mirror" checked>
+                                    <span class="checkmark"></span>
+                                </label>
+                                <label class="checkbox-container">
+                                    Phóng to khung hình (Zoom-in 8% che rìa)
+                                    <input type="checkbox" id="filter-zoom" checked>
+                                    <span class="checkmark"></span>
+                                </label>
+                                <label class="checkbox-container" title="Tạo chuyển động thu phóng mượt mà giúp lách bản quyền và giữ mắt khán giả (Lưu ý: Thời gian render sẽ lâu hơn chút).">
+                                    🫁 Kích hoạt "Khung hình biết thở" (Dynamic Ken Burns)
+                                    <input type="checkbox" id="filter-ken-burns">
+                                    <span class="checkmark"></span>
+                                </label>
+                            </div>
+
+                            <div class="grid-2col gap-4 mt-2">
+                                <div class="form-group">
+                                    <label for="filter-contrast">Tăng độ tương phản (Contrast)</label>
+                                    <select id="filter-contrast">
+                                        <option value="1.0">Mặc định (100%)</option>
+                                        <option value="1.05" selected>Tăng nhẹ (105%)</option>
+                                        <option value="1.1">Tăng mạnh (110%)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="filter-speed">Tốc độ chạy hình ảnh</label>
+                                    <select id="filter-speed">
+                                        <option value="1.0" selected>Mặc định (1.0x)</option>
+                                        <option value="1.05">Tăng nhẹ (1.05x)</option>
+                                        <option value="1.1">Tăng vừa (1.1x)</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Subtitle Styling with Live Preview -->
+                        <div class="card glass">
+                            <h3 class="card-title"><i class="fa-solid fa-font"></i> Tùy Chỉnh Phụ Đề (Subtitles Style)</h3>
+                            
+                            <label class="checkbox-container" style="margin-bottom: 15px;">
+                                Thêm phụ đề vào video (Hiển thị chữ trên màn hình)
+                                <input type="checkbox" id="enable-subtitles" checked>
+                                <span class="checkmark"></span>
+                            </label>
+                            
+                            <label class="checkbox-container" style="margin-bottom: 15px;" title="Khi bật: Chữ đang đọc đổi sang màu vàng sáng và nảy to 118%. Khi tắt: Phụ đề hiển thị tĩnh theo câu màu trắng chuẩn điện ảnh/Netflix.">
+                                🔠 Kích hoạt "Phụ đề Động" (Karaoke Word-by-Word Highlight)
+                                <input type="checkbox" id="enable-karaoke-sub" checked>
+                                <span class="checkmark"></span>
+                            </label>
+
+                            <!-- Live Preview -->
+                            <div class="subtitle-preview-box" id="subtitle-preview-box">
+                                <div class="preview-video-frame">
+                                    <div class="preview-video-bg">
+                                        <i class="fa-solid fa-film preview-bg-icon"></i>
+                                    </div>
+                                    <div class="preview-subtitle-text" id="preview-subtitle-text">
+                                        Đây là phụ đề mẫu để bạn xem trước
+                                    </div>
+                                </div>
+                                <p class="preview-label"><i class="fa-solid fa-eye"></i> Xem trước phụ đề trên video</p>
+                            </div>
+
+                            <div class="grid-3col gap-4 mt-2">
+                                <div class="form-group">
+                                    <label for="sub-size">Cỡ Chữ (px)</label>
+                                    <input type="number" id="sub-size" value="42" min="20" max="80">
+                                </div>
+                                <div class="form-group">
+                                    <label for="sub-color">Màu Chữ</label>
+                                    <input type="color" id="sub-color" value="#FFFFFF" class="color-picker-input">
+                                </div>
+                                <div class="form-group">
+                                    <label for="sub-opacity">Nền mờ (0-255)</label>
+                                    <input type="range" id="sub-opacity" min="0" max="255" value="150">
+                                </div>
+                            </div>
+
+                            <!-- Preset Buttons -->
+                            <div class="subtitle-presets">
+                                <span class="preset-label">Mẫu nhanh:</span>
+                                <button class="preset-chip" data-size="36" data-color="#FFFFFF" data-opacity="120">
+                                    <i class="fa-solid fa-text-height"></i> Nhỏ gọn
+                                </button>
+                                <button class="preset-chip active" data-size="42" data-color="#FFFFFF" data-opacity="150">
+                                    <i class="fa-solid fa-text-height"></i> Tiêu chuẩn
+                                </button>
+                                <button class="preset-chip" data-size="52" data-color="#FFFF00" data-opacity="180">
+                                    <i class="fa-solid fa-text-height"></i> Nổi bật
+                                </button>
+                                <button class="preset-chip" data-size="48" data-color="#00FFFF" data-opacity="0">
+                                    <i class="fa-solid fa-text-height"></i> Không nền
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button type="button" class="btn btn-secondary btn-back" data-target="3"><i class="fa-solid fa-arrow-left"></i> Quay Lại</button>
+                    <button type="button" class="btn btn-primary" id="btn-to-step5">Tiếp tục: Xuất Video <i class="fa-solid fa-arrow-right"></i></button>
+                </div>
+            </section>
+
+            <!-- ================= STEP 5: RENDER & DOWNLOAD ================= -->
+            <section class="wizard-panel" id="panel-5">
+                <div class="panel-header">
+                    <h2 class="section-title"><i class="fa-solid fa-file-video text-gradient-icon"></i> Render & Xuất Video Review Hoàn Chỉnh</h2>
+                    <p class="panel-desc">Kiểm tra lại toàn bộ cấu hình, tiến hành render xuất file MP4 chất lượng cao</p>
+                </div>
+
+                <div class="grid-2col gap-6">
+                    <!-- Left: Render controls & Logs -->
+                    <div class="card glass flex-column justify-between">
+                        <div>
+                            <h3 class="card-title"><i class="fa-solid fa-gear"></i> Trình Điều Khiển Xuất Video</h3>
+                            
+                            <div class="render-summary">
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-video text-cyan"></i> Video gốc:</span>
+                                    <span class="val" id="summary-video">-</span>
+                                </div>
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-list-ol text-cyan"></i> Số câu thuyết minh:</span>
+                                    <span class="val" id="summary-sentences">-</span>
+                                </div>
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-microphone text-cyan"></i> Giọng nói AI:</span>
+                                    <span class="val" id="summary-voice">-</span>
+                                </div>
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-music text-cyan"></i> Nhạc nền:</span>
+                                    <span class="val" id="summary-bgm">-</span>
+                                </div>
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-shield-halved text-cyan"></i> Bộ lọc bản quyền:</span>
+                                    <span class="val" id="summary-filters">-</span>
+                                </div>
+                                <div class="summary-item">
+                                    <span class="label"><i class="fa-solid fa-font text-cyan"></i> Phụ đề:</span>
+                                    <span class="val" id="summary-subtitle">-</span>
+                                </div>
+                            </div>
+                            
+                            <div class="form-group mt-4">
+                                <label for="export-mode"><i class="fa-solid fa-box-open"></i> Chế độ xuất file:</label>
+                                <select id="export-mode" class="w-100">
+                                    <option value="full_mp4" selected>Xuất Video Hoàn Chỉnh (MP4)</option>
+                                    <option value="capcut_zip">Gói Nguyên Liệu Cho CapCut (ZIP)</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-group mt-4">
+                                <label><i class="fa-solid fa-folder-open"></i> Thư mục xuất tự động:</label>
+                                <div class="flex-between" style="gap: 10px;">
+                                    <input id="export-directory-display" class="w-100" type="text" readonly placeholder="Chưa chọn — file vẫn nằm trong thư mục output của tool">
+                                    <button type="button" class="btn btn-secondary" id="btn-choose-export-directory"><i class="fa-solid fa-folder-tree"></i> Chọn</button>
+                                </div>
+                                <small>Thư mục này được lưu và dùng tự động cho các lần xuất sau.</small>
+                            </div>
+
+                            <button type="button" class="btn btn-primary btn-lg w-100 mt-4 py-3" id="btn-start-render">
+                                <i class="fa-solid fa-circle-play"></i> BẮT ĐẦU XUẤT VIDEO REVIEW
+                            </button>
+                        </div>
+
+                        <!-- Render status/progress box -->
+                        <div class="render-progress-box hidden" id="render-progress-box">
+                            <div class="flex-between mb-2">
+                                <span class="status-lbl" id="render-status-lbl">Đang xếp hàng...</span>
+                                <div class="render-meta">
+                                    <span class="render-timer" id="render-timer"><i class="fa-regular fa-clock"></i> 00:00</span>
+                                    <span class="status-percent" id="render-status-percent">0%</span>
+                                </div>
+                            </div>
+                            <div class="progress-bar-container">
+                                <div class="loading-progress-fill" id="render-progress-fill" style="width: 0%"></div>
+                            </div>
+                            <div class="log-terminal mt-3" id="render-log-terminal">
+                                <div class="log-line text-cyan">[*] Chuẩn bị khởi chạy luồng xử lý video...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Preview Video Container -->
+                    <div class="card glass flex-column align-center justify-center p-6">
+                        <div class="video-preview-placeholder" id="video-preview-placeholder">
+                            <i class="fa-solid fa-film placeholder-icon"></i>
+                            <p class="placeholder-title">Video Review sẽ hiển thị tại đây</p>
+                            <ul class="placeholder-tips">
+                                <li><i class="fa-solid fa-check text-green"></i> Hệ thống sẽ render tự động</li>
+                                <li><i class="fa-solid fa-check text-green"></i> Có thể xem trước ngay trên trang</li>
+                                <li><i class="fa-solid fa-check text-green"></i> Tải về MP4 hoặc gói CapCut</li>
+                            </ul>
+                        </div>
+                        
+                        <div class="video-preview-wrapper hidden" id="video-preview-wrapper">
+                            <video id="final-video-player" controls width="100%" class="final-video">
+                                <source src="" type="video/mp4">
+                                Trình duyệt của bạn không hỗ trợ thẻ video.
+                            </video>
+                            <a href="" download class="btn btn-success btn-lg w-100 mt-4 download-btn-glow" id="btn-download-video">
+                                <i class="fa-solid fa-circle-down"></i> TẢI VIDEO REVIEW NGAY (MP4)
+                            </a>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button type="button" class="btn btn-secondary btn-back" id="btn-render-back" data-target="4"><i class="fa-solid fa-arrow-left"></i> Quay Lại</button>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <!-- Micro-interaction / Toast Notification -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- Core Scripts -->
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

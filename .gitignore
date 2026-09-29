@@ -1,0 +1,50 @@
+# Environments
+.env
+.venv/
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+tool_calls_log.txt
+
+# Media files (Video, Audio, Images)
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.png
+*.gif
+
+# Output and temp processing folders
+static/output/
+static/videos/
+static/temp/
+static/temp_preview/
+temp_processing/
+temp_dir/
+temp_*/
+.scene_cache/
+_baseline*/
+*.ass
+*.srt
+*.zip
+
+# Backup files
+*.bak
+*_stable.py
+
+# Local machine settings and scratch utilities
+app_settings.json
+extract.py
+extract2.py
+test_edge.py
+test_ssml.py
+test_submaker.py
+test_tts.py
