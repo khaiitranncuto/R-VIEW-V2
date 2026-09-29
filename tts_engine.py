@@ -4,11 +4,21 @@ import asyncio
 import subprocess
 import edge_tts
 import traceback
+import hashlib
+import json
+import shutil
+from datetime import timedelta
 
-_TIME_VALUE_PATTERN = r'(?:(?:\d+):)?\d{1,2}:\d{2}'
+# Accept both mm:ss (including videos longer than 99 minutes) and hh:mm:ss.
+# Ordering the 3-part alternative first prevents a partial match on 01:39:47.
+_TIME_VALUE_PATTERN = r'(?:\d+:\d{1,2}:\d{2}|\d+:\d{2})'
 TIMESTAMP_TOKEN_RE = re.compile(
     rf'\[(?:TIME=)?(?P<start>{_TIME_VALUE_PATTERN})'
     rf'(?:\s*-\s*(?P<end>{_TIME_VALUE_PATTERN}))?\]',
+    flags=re.IGNORECASE,
+)
+VISUAL_BEAT_TOKEN_RE = re.compile(
+    rf'\[BEAT=(?P<start>{_TIME_VALUE_PATTERN})\s*-\s*(?P<end>{_TIME_VALUE_PATTERN})\]',
     flags=re.IGNORECASE,
 )
 
@@ -66,6 +76,66 @@ def _split_action_clauses(sentence):
     return [part.strip() for part in expanded if part.strip()]
 
 
+def split_visual_beats(sentence, max_beats=2):
+    """Split narration into a small number of independently editable actions."""
+    sentence = (sentence or "").strip()
+    if not sentence:
+        return []
+    # Unicode escapes keep these rules reliable even on Windows consoles using
+    # a legacy code page.
+    connectors = (
+        r"r\u1ed3i|sau \u0111\u00f3|nh\u01b0ng|\u0111\u1ed3ng th\u1eddi|b\u1ea5t ng\u1edd|"
+        r"l\u1eadp t\u1ee9c|ti\u1ebfp t\u1ee5c|lao|cu\u1ed1n|ch\u1ea1y|nh\u1ea3y|"
+        r"t\u1ea5n c\u00f4ng|\u0111\u00e1nh|k\u00e9o|n\u00e9m|r\u01a1i|xu\u1ea5t hi\u1ec7n|"
+        r"bi\u1ebfn m\u1ea5t|quay|\u0111u\u1ed5i|tr\u1ed1n|tho\u00e1t"
+    )
+    candidates = re.split(r"(?<=[.!?;])\s+", sentence)
+    expanded = []
+    for candidate in candidates:
+        comma_parts = re.split(rf",\s+(?=(?:{connectors})\b)", candidate, flags=re.IGNORECASE)
+        for part in comma_parts:
+            expanded.extend(re.split(rf"\s+(?=v\u00e0\s+(?:{connectors})\b)", part, flags=re.IGNORECASE))
+    expanded = [item.strip() for item in expanded if item.strip()]
+    if len(expanded) <= max_beats:
+        return expanded
+    # Keep the cut count bounded: preserve the first action and join the rest.
+    return [expanded[0], " ".join(expanded[1:])]
+
+
+def _format_time_value(seconds):
+    seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _allocate_visual_beat_ranges(beats, start, end):
+    """Allocate one source sub-range per beat while preserving chronological order."""
+    minimum_seconds_per_beat = 2.0  # Integer timestamp format; safely above the 1.5s policy.
+    if (
+        len(beats) <= 1 or start is None or end is None or end <= start
+        or end - start < len(beats) * minimum_seconds_per_beat
+    ):
+        return [(start, end, beats[0])] if beats else []
+    total_words = sum(max(1, len(beat.split())) for beat in beats)
+    cursor = float(start)
+    allocated = []
+    for index, beat in enumerate(beats):
+        if index == len(beats) - 1:
+            beat_end = float(end)
+        else:
+            share = max(1, len(beat.split())) / total_words
+            beat_end = cursor + (float(end) - float(start)) * share
+            remaining_minimum = (len(beats) - index - 1) * minimum_seconds_per_beat
+            beat_end = min(
+                float(end) - remaining_minimum,
+                max(cursor + minimum_seconds_per_beat, beat_end),
+            )
+        allocated.append((cursor, beat_end, beat))
+        cursor = beat_end
+    return allocated
+
+
 def get_ffmpeg_exe():
     try:
         import imageio_ffmpeg
@@ -83,7 +153,7 @@ def get_audio_duration(filepath):
     if dur_match:
         h, m, s_dur, cs = dur_match.groups()
         return int(h)*3600 + int(m)*60 + int(s_dur) + int(cs)/100.0
-    return 1.0
+    return 0.0
 
 def split_text_into_sentences(text):
     """
@@ -131,9 +201,19 @@ def split_text_into_sentences(text):
                 sentences.append(f"{timestamp} {part}".strip())
                 continue
             if has_explicit_end:
-                # A START-END row is an atomic narration/clip contract. Do not
-                # duplicate its range by splitting it into several TTS chunks.
-                sentences.append(f"{timestamp} {part}".strip())
+                # [BEAT=...] keeps several visual actions inside one natural
+                # narration take. Do not split this row into separate TTS items.
+                if VISUAL_BEAT_TOKEN_RE.search(part):
+                    sentences.append(f"{timestamp} {part}".strip())
+                    continue
+                # One Gemini row may describe two consecutive actions. Give
+                # each action its own chronological visual range, but cap the
+                # cut count so the result does not become frantic.
+                beats = split_visual_beats(part, max_beats=2)
+                start, end, _ = extract_time_range(timestamp)
+                for beat_start, beat_end, beat in _allocate_visual_beat_ranges(beats, start, end):
+                    beat_time = f"[TIME={_format_time_value(beat_start)}-{_format_time_value(beat_end)}]"
+                    sentences.append(f"{beat_time} {beat}".strip())
                 continue
             for raw_sentence in sentence_end.split(part):
                 for action in _split_action_clauses(raw_sentence):
@@ -203,6 +283,7 @@ def sanitize_script_text(text):
     """Xóa toàn bộ thẻ timestamp dạng [TIME=mm:ss] hoặc [TIME=hh:mm:ss] và ký tự rác khỏi kịch bản."""
     # Xóa toàn bộ timestamp còn sót lại trong câu
     cleaned = TIMESTAMP_TOKEN_RE.sub('', text)
+    cleaned = VISUAL_BEAT_TOKEN_RE.sub('', cleaned)
     # Xóa khoảng trắng thừa
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
@@ -231,11 +312,143 @@ def parse_sentences_and_time_ranges(sentences):
         ends.append(end)
     return clean_sentences, starts, ends
 
+
+def parse_sentences_and_visual_beats(sentences):
+    """Keep narration intact while extracting independently timed visual beats.
+
+    The first visual beat uses the row's [TIME=start-end]. Additional actions
+    may be introduced inline with [BEAT=start-end]. These markers are removed
+    before TTS so prosody remains that of one complete sentence/paragraph.
+    """
+    clean_sentences = []
+    starts = []
+    ends = []
+    visual_groups = []
+
+    for sentence in sentences:
+        start, end, body = extract_time_range(sentence)
+        markers = list(VISUAL_BEAT_TOKEN_RE.finditer(body))
+        parts = []
+        cursor = 0
+        beat_start, beat_end = start, end
+        for marker in markers:
+            text = sanitize_script_text(body[cursor:marker.start()])
+            if text:
+                parts.append({"text": text, "start": beat_start, "end": beat_end})
+            beat_start = _time_value_to_seconds(marker.group("start"))
+            beat_end = _time_value_to_seconds(marker.group("end"))
+            cursor = marker.end()
+        tail = sanitize_script_text(body[cursor:])
+        if tail:
+            parts.append({"text": tail, "start": beat_start, "end": beat_end})
+
+        clean = sanitize_script_text(body)
+        if not parts and clean:
+            parts = [{"text": clean, "start": start, "end": end}]
+        clean_sentences.append(clean)
+        starts.append(start)
+        ends.append(end)
+        visual_groups.append(parts)
+
+    return clean_sentences, starts, ends, visual_groups
+
+
+def expand_visual_beats(sentences, durations, visual_groups, word_cues=None):
+    """Create an audio-led visual EDL using real TTS word boundaries."""
+    beat_texts, beat_durations, beat_starts, beat_ends = [], [], [], []
+    word_cues = word_cues or [[] for _ in sentences]
+
+    for index, sentence in enumerate(sentences):
+        duration = max(0.05, float(durations[index]))
+        beats = visual_groups[index] if index < len(visual_groups) else []
+        if not beats:
+            beats = [{"text": sentence, "start": None, "end": None}]
+        cues = word_cues[index] if index < len(word_cues) else []
+
+        if len(beats) == 1:
+            boundaries = [0.0, duration]
+        elif cues and len(cues) >= len(beats):
+            partitions = _cue_partitions(cues, [beat["text"] for beat in beats])
+            cue_end = max(float(cues[-1]["end"]), 0.001)
+            scale = duration / cue_end
+            boundaries = [0.0]
+            for _, cue_index in partitions[:-1]:
+                left = float(cues[max(0, cue_index - 1)]["end"])
+                right = float(cues[min(len(cues) - 1, cue_index)]["start"])
+                boundaries.append(min(duration, max(boundaries[-1], (left + right) * 0.5 * scale)))
+            boundaries.append(duration)
+        else:
+            weights = [max(1, len(re.findall(r"\w+", beat["text"], flags=re.UNICODE))) for beat in beats]
+            total = max(1, sum(weights))
+            boundaries = [0.0]
+            running = 0
+            for weight in weights[:-1]:
+                running += weight
+                boundaries.append(duration * running / total)
+            boundaries.append(duration)
+
+        for beat_index, beat in enumerate(beats):
+            beat_texts.append(beat["text"])
+            beat_durations.append(max(0.05, boundaries[beat_index + 1] - boundaries[beat_index]))
+            beat_starts.append(beat.get("start"))
+            beat_ends.append(beat.get("end"))
+
+    return beat_texts, beat_durations, beat_starts, beat_ends
+
 # 2. Tao giong doc TTS - SUBMAKER cho thoi gian chinh xac tung tu
 # =====================================================================
 MAX_TTS_RETRIES = 3
+TTS_MAX_CONCURRENCY = 3
+TTS_RETRY_DELAYS = (5.0, 15.0)
+TTS_RECOVERY_DELAYS = (10.0, 30.0, 60.0, 120.0)
+TTS_REQUEST_TIMEOUT = 60.0
+TTS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tts_cache")
+TTS_SAFE_TEXT_CHARS = 500
 
-async def generate_tts_chunk_with_timing(text, voice, rate, output_path, log_fn=None, chunk_index=None):
+
+def _split_long_tts_text(text, max_chars=TTS_SAFE_TEXT_CHARS):
+    """Split oversized service requests at natural punctuation/word boundaries."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    units = re.split(r"(?<=[.!?;,:])\s+", text)
+    chunks = []
+    current = ""
+    for unit in units:
+        words = unit.split()
+        while words:
+            room = max_chars - len(current) - (1 if current else 0)
+            candidate = " ".join(words)
+            if len(candidate) <= room:
+                current = f"{current} {candidate}".strip()
+                words = []
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+                continue
+            piece = []
+            piece_len = 0
+            while words and piece_len + len(words[0]) + (1 if piece else 0) <= max_chars:
+                word = words.pop(0)
+                piece.append(word)
+                piece_len += len(word) + (1 if len(piece) > 1 else 0)
+            if not piece:
+                piece = [words.pop(0)[:max_chars]]
+            chunks.append(" ".join(piece))
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _wait_before_tts_retry(attempt):
+    """Short, bounded cooldown between attempts."""
+    base_delay = TTS_RETRY_DELAYS[min(attempt, len(TTS_RETRY_DELAYS) - 1)]
+    await asyncio.sleep(base_delay)
+
+async def generate_tts_chunk_with_timing(
+    text, voice, rate, output_path, log_fn=None, chunk_index=None, max_retries=None
+):
     """Generate TTS audio va lay thoi gian chinh xac tung cau bang SubMaker."""
     from edge_tts import SubMaker
     import re
@@ -243,37 +456,67 @@ async def generate_tts_chunk_with_timing(text, voice, rate, output_path, log_fn=
     # Khong dung the BREAK nua — chi truyen van ban thuan tuy
     audio_text = text
     
-    for attempt in range(MAX_TTS_RETRIES):
+    retry_count = max(1, int(max_retries or MAX_TTS_RETRIES))
+    for attempt in range(retry_count):
         try:
             if log_fn:
-                log_fn("INFO", f"TTS cau {chunk_index + 1}: bat dau lan thu {attempt + 1}/{MAX_TTS_RETRIES} (voice={voice}, {len(text)} ky tu)")
+                log_fn("INFO", f"TTS cau {chunk_index + 1}: bat dau lan thu {attempt + 1}/{retry_count} (voice={voice}, {len(text)} ky tu)")
             # boundary='word' de nhan SentenceBoundary events (Viet chi co SentenceBoundary)
-            communicate = edge_tts.Communicate(audio_text, voice, rate=rate, boundary='word')
+            communicate = edge_tts.Communicate(
+                audio_text,
+                voice,
+                rate=rate,
+                boundary='word',
+                connect_timeout=10,
+                receive_timeout=60,
+            )
             submaker = SubMaker()
-            
-            with open(output_path, "wb") as f:
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        f.write(chunk["data"])
-                    elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
-                        submaker.feed(chunk)
-            
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+
+            async def receive_audio():
+                with open(output_path, "wb") as f:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            f.write(chunk["data"])
+                        elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                            submaker.feed(chunk)
+
+            await asyncio.wait_for(receive_audio(), timeout=TTS_REQUEST_TIMEOUT)
+
+            audio_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            minimum_size = max(4000, len(audio_text) * 40)
+            has_valid_cues = bool(submaker.cues)
+            if audio_size >= minimum_size and has_valid_cues:
                 if log_fn:
-                    log_fn("SUCCESS", f"TTS cau {chunk_index + 1}: thanh cong, {os.path.getsize(output_path)} bytes")
+                    log_fn("SUCCESS", f"TTS cau {chunk_index + 1}: thanh cong, {audio_size} bytes")
                 return submaker
+
+            if log_fn:
+                log_fn(
+                    "WARNING",
+                    f"TTS cau {chunk_index + 1}: audio thieu ({audio_size} bytes); thu lai",
+                )
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
             
-            if attempt < MAX_TTS_RETRIES - 1:
-                await asyncio.sleep(2.0)
+            if attempt < retry_count - 1:
+                await _wait_before_tts_retry(attempt)
         except Exception as e:
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
             if log_fn:
                 log_fn(
                     "ERROR",
                     f"TTS cau {chunk_index + 1}, lan {attempt + 1}: {type(e).__name__}: {e}",
                     traceback.format_exc(),
                 )
-            if attempt < MAX_TTS_RETRIES - 1:
-                await asyncio.sleep(2.0)
+            if attempt < retry_count - 1:
+                await _wait_before_tts_retry(attempt)
     return None
 
 def split_text_for_ass(text, max_len=40):
@@ -309,7 +552,7 @@ async def process_one_tts(i, s, voice, rate, chunk_path, sem, ffmpeg_exe, log_fn
                 chunk_path
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return (i, "SFX", chunk_path, None)
-        return (i, "MISSING_SFX", None, None)
+        raise FileNotFoundError(f"Khong tim thay SFX: {sfx_filename}")
     
     # normal TTS
     async with sem:
@@ -318,16 +561,447 @@ async def process_one_tts(i, s, voice, rate, chunk_path, sem, ffmpeg_exe, log_fn
         
         if submaker is None or not os.path.exists(chunk_path):
             if log_fn:
-                log_fn("WARNING", f"TTS cau {i + 1}: het retry, tao 3 giay im lang de tiep tuc chan doan")
-            subprocess.run([
-                ffmpeg_exe, "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                "-t", "3.0", "-c:a", "libmp3lame", "-q:a", "9", chunk_path
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return (i, "EMPTY_TTS", chunk_path, None)
+                log_fn("ERROR", f"TTS cau {i + 1}: that bai sau {MAX_TTS_RETRIES} lan; dung truoc khi render de tranh mat giong")
+            raise RuntimeError(f"TTS cau {i + 1} that bai sau {MAX_TTS_RETRIES} lan thu.")
             
         return (i, "TTS", chunk_path, submaker)
 
-def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log_fn=None):
+
+def _build_tts_groups(sentences, sentence_voices, max_items=4, max_chars=280):
+    """Group adjacent narration beats so Edge TTS keeps natural prosody."""
+    groups = []
+    current = []
+    current_voice = None
+    for index, text in enumerate(sentences):
+        voice = sentence_voices[index]
+        if voice == "VOICE_TAG":
+            continue
+        if voice == "SFX":
+            if current:
+                groups.append((current_voice, current))
+                current = []
+            groups.append(("SFX", [(index, text)]))
+            current_voice = None
+            continue
+        would_be = sum(len(item[1]) for item in current) + len(text) + len(current)
+        if current and (voice != current_voice or len(current) >= max_items or would_be > max_chars):
+            groups.append((current_voice, current))
+            current = []
+        current_voice = voice
+        current.append((index, text))
+    if current:
+        groups.append((current_voice, current))
+    return groups
+
+
+def _cue_partitions(cues, texts):
+    """Map word-boundary cues back to narration beats by cumulative word count."""
+    if not cues or len(texts) <= 1:
+        return [(0, len(cues))]
+    weights = [max(1, len(re.findall(r"\w+", text, flags=re.UNICODE))) for text in texts]
+    total_weight = sum(weights)
+    partitions = []
+    cue_start = 0
+    cumulative_weight = 0
+    for index, weight in enumerate(weights):
+        cumulative_weight += weight
+        if index == len(weights) - 1:
+            cue_end = len(cues)
+        else:
+            cue_end = round(len(cues) * cumulative_weight / total_weight)
+            cue_end = min(len(cues) - (len(weights) - index - 1), max(cue_start + 1, cue_end))
+        partitions.append((cue_start, cue_end))
+        cue_start = cue_end
+    return partitions
+
+
+def _tts_cache_paths(text, voice, rate):
+    identity = f"v2\0{voice}\0{rate}\0{text}".encode("utf-8", errors="replace")
+    cache_key = hashlib.sha256(identity).hexdigest()
+    return (
+        os.path.join(TTS_CACHE_DIR, f"{cache_key}.mp3"),
+        os.path.join(TTS_CACHE_DIR, f"{cache_key}.json"),
+    )
+
+
+def _load_cached_tts(text, voice, rate, raw_path):
+    """Restore audio and word cues from the persistent cache."""
+    from edge_tts import SubMaker
+    from edge_tts.submaker import Subtitle
+
+    audio_cache, cue_cache = _tts_cache_paths(text, voice, rate)
+    minimum_size = max(4000, len(text) * 40)
+    if (
+        not os.path.isfile(audio_cache)
+        or os.path.getsize(audio_cache) < minimum_size
+        or not os.path.isfile(cue_cache)
+    ):
+        return None
+    try:
+        with open(cue_cache, "r", encoding="utf-8") as cue_file:
+            cue_items = json.load(cue_file)
+        submaker = SubMaker()
+        for cue in cue_items:
+            submaker.cues.append(Subtitle(
+                index=None,
+                start=timedelta(seconds=float(cue["start"])),
+                end=timedelta(seconds=float(cue["end"])),
+                content=str(cue["content"]),
+            ))
+        if not submaker.cues:
+            return None
+        cached_duration = get_audio_duration(audio_cache)
+        if cached_duration <= 0.05 or submaker.cues[-1].end.total_seconds() > cached_duration + 0.75:
+            return None
+        shutil.copy2(audio_cache, raw_path)
+        return submaker
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _save_cached_tts(text, voice, rate, raw_path, submaker):
+    """Atomically cache a successful Edge TTS response for later renders."""
+    if not os.path.isfile(raw_path) or os.path.getsize(raw_path) <= 1000:
+        return
+    os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+    audio_cache, cue_cache = _tts_cache_paths(text, voice, rate)
+    audio_temp = audio_cache + ".tmp"
+    cue_temp = cue_cache + ".tmp"
+    cue_items = [
+        {
+            "start": cue.start.total_seconds(),
+            "end": cue.end.total_seconds(),
+            "content": cue.content,
+        }
+        for cue in (submaker.cues or [])
+    ]
+    try:
+        shutil.copy2(raw_path, audio_temp)
+        with open(cue_temp, "w", encoding="utf-8", newline="\n") as cue_file:
+            json.dump(cue_items, cue_file, ensure_ascii=False)
+        os.replace(audio_temp, audio_cache)
+        os.replace(cue_temp, cue_cache)
+    except OSError:
+        for temp_path in (audio_temp, cue_temp):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _invalidate_tts_group_cache(items, voice, rate):
+    """Remove only the failed group's cache; successful groups stay immutable."""
+    if voice == "SFX":
+        return False
+    group_text = " ".join(text for _, text in items)
+    removed = False
+    for cache_path in _tts_cache_paths(group_text, voice, rate):
+        try:
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+                removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def _exception_details(exc):
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
+
+
+async def _recover_tts_group_as_individual_items(
+    group_index, items, voice, rate, temp_dir, ffmpeg_exe, log_fn=None
+):
+    """Fallback for one stubborn group without changing sentence ids or order."""
+    if voice == "SFX":
+        sem = asyncio.Semaphore(1)
+        return await process_tts_group(
+            group_index, items, voice, rate, temp_dir, sem, ffmpeg_exe, log_fn,
+            max_retries=MAX_TTS_RETRIES,
+        )
+
+    item_results = []
+    item_master_paths = []
+    sem = asyncio.Semaphore(1)
+    for item_position, item in enumerate(items):
+        synthetic_group_index = 100000 + group_index * 10 + item_position
+        _, recovered_items, item_master = await process_tts_group(
+            synthetic_group_index,
+            [item],
+            voice,
+            rate,
+            temp_dir,
+            sem,
+            ffmpeg_exe,
+            log_fn,
+            max_retries=MAX_TTS_RETRIES,
+        )
+        item_results.extend(recovered_items)
+        if not item_master:
+            raise RuntimeError(f"TTS recovery cum {group_index + 1} thieu master audio")
+        item_master_paths.append(item_master)
+
+    concat_list = os.path.join(temp_dir, f"recovery_group_{group_index:03d}.txt")
+    with open(concat_list, "w", encoding="utf-8", newline="\n") as concat_file:
+        for item_master in item_master_paths:
+            safe_path = os.path.abspath(item_master).replace(chr(92), "/")
+            concat_file.write(f"file '{safe_path}'\n")
+    recovered_master = os.path.join(temp_dir, f"tts_group_{group_index:03d}.mp3")
+    concat_result = subprocess.run([
+        ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
+        "-c:a", "libmp3lame", "-q:a", "3", recovered_master,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if concat_result.returncode != 0 or get_audio_duration(recovered_master) <= 0.05:
+        raise RuntimeError(f"Khong ghep duoc TTS recovery cum {group_index + 1}")
+
+    # Preserve the original sentence order and make per-sentence durations add
+    # up exactly to the recovered master which is passed to the unchanged renderer.
+    recovered_duration = get_audio_duration(recovered_master)
+    planned_duration = sum(float(item[4]) for item in item_results if len(item) >= 5)
+    if planned_duration <= 0.05:
+        raise RuntimeError(f"TTS recovery cum {group_index + 1} co duration khong hop le")
+    scale = recovered_duration / planned_duration
+    item_results = [
+        (*item[:4], float(item[4]) * scale) if len(item) >= 5 else item
+        for item in item_results
+    ]
+    item_results.sort(key=lambda item: item[0])
+    if log_fn:
+        sentence_numbers = ", ".join(str(index + 1) for index, _ in items)
+        log_fn(
+            "SUCCESS",
+            f"TTS recovery cum {group_index + 1}: da tao tuan tu cau {sentence_numbers}",
+        )
+    return group_index, item_results, recovered_master
+
+
+async def _recover_failed_tts_groups(
+    failed_groups, rate, temp_dir, ffmpeg_exe, log_fn=None
+):
+    """Retry only failed groups with cooldown, cache repair and circuit breaker."""
+    pending = list(failed_groups)
+    recovered = []
+    last_errors = {group_index: exc for group_index, _, exc in pending}
+
+    for recovery_round, cooldown in enumerate(TTS_RECOVERY_DELAYS, start=1):
+        if not pending:
+            break
+        if log_fn:
+            log_fn(
+                "WARNING",
+                f"TTS recovery vong {recovery_round}/{len(TTS_RECOVERY_DELAYS)}: "
+                f"con {len(pending)} cum loi; giam xuong 1 ket noi va cho {int(cooldown)} giay.",
+            )
+        await asyncio.sleep(cooldown)
+        next_pending = []
+
+        for group_index, (voice, items), _ in pending:
+            repaired_cache = _invalidate_tts_group_cache(items, voice, rate)
+            if repaired_cache and log_fn:
+                log_fn("WARNING", f"TTS cum {group_index + 1}: cache loi da duoc loai bo rieng")
+            try:
+                if recovery_round <= 2:
+                    result = await process_tts_group(
+                        group_index,
+                        items,
+                        voice,
+                        rate,
+                        temp_dir,
+                        asyncio.Semaphore(1),
+                        ffmpeg_exe,
+                        log_fn,
+                        max_retries=MAX_TTS_RETRIES,
+                    )
+                else:
+                    result = await _recover_tts_group_as_individual_items(
+                        group_index, items, voice, rate, temp_dir, ffmpeg_exe, log_fn
+                    )
+                recovered.append(result)
+            except Exception as exc:
+                last_errors[group_index] = exc
+                next_pending.append((group_index, (voice, items), exc))
+                if log_fn:
+                    sentence_numbers = ", ".join(str(index + 1) for index, _ in items)
+                    log_fn(
+                        "ERROR",
+                        f"TTS recovery cum {group_index + 1} (cau {sentence_numbers}) "
+                        f"vong {recovery_round}: {type(exc).__name__}: {exc}",
+                        _exception_details(exc),
+                    )
+        pending = next_pending
+
+    return recovered, pending, last_errors
+
+
+async def _generate_oversized_tts(
+    text, voice, rate, raw_path, temp_dir, group_index, log_fn=None, max_retries=None
+):
+    """Synthesize a long narration as safe requests and rebuild one cue timeline."""
+    from edge_tts import SubMaker
+    from edge_tts.submaker import Subtitle
+
+    pieces = _split_long_tts_text(text)
+    if len(pieces) <= 1:
+        return None
+    if log_fn:
+        log_fn(
+            "WARNING",
+            f"TTS cau {group_index + 1} dai {len(text)} ky tu; tu chia thanh {len(pieces)} doan an toan.",
+        )
+
+    ffmpeg_exe = get_ffmpeg_exe()
+    piece_paths = []
+    combined = SubMaker()
+    offset = 0.0
+    for piece_index, piece in enumerate(pieces):
+        piece_path = os.path.join(temp_dir, f"tts_long_{group_index:04d}_{piece_index:02d}.mp3")
+        piece_submaker = await generate_tts_chunk_with_timing(
+            piece, voice, rate, piece_path, log_fn, group_index,
+            max_retries=max_retries,
+        )
+        if piece_submaker is None or not os.path.isfile(piece_path):
+            raise RuntimeError(
+                f"TTS cau {group_index + 1}: doan nho {piece_index + 1}/{len(pieces)} that bai."
+            )
+        piece_duration = get_audio_duration(piece_path)
+        if piece_duration <= 0.05:
+            raise RuntimeError(f"TTS cau {group_index + 1}: doan nho co audio khong hop le.")
+        for cue in piece_submaker.cues or []:
+            combined.cues.append(Subtitle(
+                index=None,
+                start=timedelta(seconds=offset + cue.start.total_seconds()),
+                end=timedelta(seconds=offset + cue.end.total_seconds()),
+                content=cue.content,
+            ))
+        piece_paths.append(piece_path)
+        offset += piece_duration
+
+    concat_path = os.path.join(temp_dir, f"tts_long_{group_index:04d}.txt")
+    with open(concat_path, "w", encoding="utf-8", newline="\n") as concat_file:
+        for piece_path in piece_paths:
+            safe_path = os.path.abspath(piece_path).replace(chr(92), "/")
+            concat_file.write(f"file '{safe_path}'\n")
+    result = subprocess.run([
+        ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_path,
+        "-c:a", "libmp3lame", "-q:a", "3", raw_path,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode != 0 or get_audio_duration(raw_path) <= 0.05:
+        raise RuntimeError(f"TTS cau {group_index + 1}: khong ghep duoc cac doan nho.")
+    return combined
+
+
+async def process_tts_group(
+    group_index, items, voice, rate, temp_dir, sem, ffmpeg_exe, log_fn=None, max_retries=None
+):
+    """Generate one continuous TTS take and expose sentence-sized timing chunks."""
+    if voice == "SFX":
+        index, text = items[0]
+        chunk_path = os.path.join(temp_dir, f"chunk_{index:03d}.mp3")
+        result = await process_one_tts(index, text, voice, rate, chunk_path, sem, ffmpeg_exe, log_fn)
+        return group_index, [result], None
+
+    import random
+    from edge_tts import SubMaker
+    from edge_tts.submaker import Subtitle
+
+    group_text = " ".join(text for _, text in items)
+    raw_path = os.path.join(temp_dir, f"tts_group_{group_index:03d}_raw.mp3")
+    group_path = os.path.join(temp_dir, f"tts_group_{group_index:03d}.mp3")
+    submaker = _load_cached_tts(group_text, voice, rate, raw_path)
+    if submaker is not None:
+        if log_fn:
+            log_fn("SUCCESS", f"TTS cum {group_index + 1}: dung cache, khong goi lai Microsoft")
+    elif len(group_text) > TTS_SAFE_TEXT_CHARS:
+        async with sem:
+            submaker = await _generate_oversized_tts(
+                group_text, voice, rate, raw_path, temp_dir, group_index, log_fn,
+                max_retries=max_retries,
+            )
+        if submaker is not None and os.path.exists(raw_path):
+            _save_cached_tts(group_text, voice, rate, raw_path, submaker)
+    else:
+        async with sem:
+            await asyncio.sleep(random.uniform(0.1, 0.6))
+            submaker = await generate_tts_chunk_with_timing(
+                group_text, voice, rate, raw_path, log_fn, items[0][0], max_retries=max_retries
+            )
+        if submaker is not None and os.path.exists(raw_path):
+            _save_cached_tts(group_text, voice, rate, raw_path, submaker)
+
+    if submaker is None or not os.path.exists(raw_path):
+        failed_sentences = ", ".join(str(index + 1) for index, _ in items)
+        if log_fn:
+            log_fn(
+                "ERROR",
+                f"TTS cum {group_index + 1} (cau {failed_sentences}) chua tao duoc audio",
+            )
+        raise RuntimeError(f"Khong tao duoc giong doc cho cau {failed_sentences}.")
+
+    raw_duration = get_audio_duration(raw_path)
+    cue_end = submaker.cues[-1].end.total_seconds() if submaker.cues else raw_duration
+    # Protect quiet Vietnamese final consonants, while removing Edge's variable
+    # service padding. No amplitude-based silence trimming is used.
+    content_end = min(raw_duration, cue_end + 0.18)
+    trim_result = subprocess.run([
+        ffmpeg_exe, "-y", "-i", raw_path, "-af", f"atrim=0:{content_end:.6f},asetpts=PTS-STARTPTS",
+        "-ar", "24000", "-ac", "1", "-c:a", "libmp3lame", "-q:a", "3", group_path,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if trim_result.returncode != 0:
+        group_path = raw_path
+        content_end = raw_duration
+    encoded_group_duration = get_audio_duration(group_path)
+    if encoded_group_duration <= 0.05:
+        raise RuntimeError(f"TTS group {group_index} co master audio khong hop le")
+    duration_scale = encoded_group_duration / max(content_end, 0.001)
+
+    cues = list(submaker.cues or [])
+    partitions = _cue_partitions(cues, [text for _, text in items])
+    boundaries = [0.0]
+    for _, cue_index in partitions[:-1]:
+        left = cues[max(0, cue_index - 1)].end.total_seconds()
+        right = cues[min(len(cues) - 1, cue_index)].start.total_seconds()
+        boundaries.append(min(content_end, max(boundaries[-1], (left + right) / 2.0)))
+    boundaries.append(content_end)
+
+    results = []
+    for item_pos, (index, _) in enumerate(items):
+        start_time, end_time = boundaries[item_pos], boundaries[item_pos + 1]
+        chunk_path = os.path.join(temp_dir, f"chunk_{index:03d}.mp3")
+        split_result = subprocess.run([
+            ffmpeg_exe, "-y", "-i", group_path,
+            "-af", f"atrim={start_time:.6f}:{end_time:.6f},asetpts=PTS-STARTPTS",
+            "-ar", "24000", "-ac", "1", "-c:a", "libmp3lame", "-q:a", "3", chunk_path,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if split_result.returncode != 0:
+            raise RuntimeError(f"Khong tach duoc TTS group {group_index}, cau {index + 1}")
+        actual_chunk_duration = get_audio_duration(chunk_path)
+        if actual_chunk_duration <= 0.05:
+            raise RuntimeError(f"TTS group {group_index}, cau {index + 1} co audio khong hop le")
+
+        local_submaker = SubMaker()
+        cue_from, cue_to = partitions[item_pos]
+        for cue in cues[cue_from:cue_to]:
+            local_start = max(0.0, cue.start.total_seconds() - start_time)
+            local_end = max(local_start, cue.end.total_seconds() - start_time)
+            local_submaker.cues.append(Subtitle(
+                index=None,
+                start=timedelta(seconds=local_start),
+                end=timedelta(seconds=local_end),
+                content=cue.content,
+            ))
+        # Visual durations must add up to the grouped master track that will be
+        # muxed. Using each re-encoded chunk's MP3 padding would accumulate drift.
+        timeline_duration = (end_time - start_time) * duration_scale
+        results.append((index, "TTS", chunk_path, local_submaker, timeline_duration))
+    if log_fn:
+        log_fn("SUCCESS", f"TTS cum {group_index + 1}: {len(items)} y/cau trong mot luot doc lien mach")
+    return group_index, results, group_path
+
+def generate_all_tts(
+    sentences, default_voice, rate, temp_dir, options=None, log_fn=None,
+    return_word_cues=False,
+):
     """
     Tao TTS tung cau va lay thong tin Subtitles (SubMaker).
     Phien ban DA LUONG (Concurrent Async) de tang toc do x10 cho video dai.
@@ -352,21 +1026,75 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
     # 2. Khoi tao loop va Semaphore
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    sem = asyncio.Semaphore(3) # 3 luong cung luc de tranh bi Microsoft block IP
+    sem = asyncio.Semaphore(TTS_MAX_CONCURRENCY)
     
-    tasks = []
-    for i, s in enumerate(sentences):
-        v = sentence_voices[i]
-        if v == "VOICE_TAG":
-            continue
-        chunk_path = os.path.join(temp_dir, f"chunk_{i:03d}.mp3")
-        tasks.append(process_one_tts(i, s, v, rate, chunk_path, sem, ffmpeg_exe, log_fn))
+    tts_groups = _build_tts_groups(sentences, sentence_voices)
+    tasks = [
+        process_tts_group(group_index, items, voice, rate, temp_dir, sem, ffmpeg_exe, log_fn)
+        for group_index, (voice, items) in enumerate(tts_groups)
+    ]
         
-    print(f"[INFO] Bat dau tai TTS {len(tasks)} file song song (Semaphore 3)...")
+    print(f"[INFO] Bat dau tai TTS {len(tasks)} cum (toi da {TTS_MAX_CONCURRENCY} ket noi song song)...")
     if log_fn:
-        log_fn("INFO", f"TTS: chuan bi {len(tasks)} cau, toi da 3 ket noi song song")
+        log_fn("INFO", f"TTS: {len(sentences)} y/cau, {len(tasks)} cum lien mach, toi da {TTS_MAX_CONCURRENCY} ket noi, retry {MAX_TTS_RETRIES} lan")
     try:
-        results = loop.run_until_complete(asyncio.gather(*tasks))
+        first_outcomes = loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        group_results = []
+        failed_groups = []
+        for group_index, outcome in enumerate(first_outcomes):
+            if isinstance(outcome, Exception):
+                failed_groups.append((group_index, tts_groups[group_index], outcome))
+                if log_fn:
+                    voice, items = tts_groups[group_index]
+                    sentence_numbers = ", ".join(str(i + 1) for i, _ in items)
+                    log_fn(
+                        "ERROR",
+                        f"TTS cum {group_index + 1} (cau {sentence_numbers}) loi ban dau: "
+                        f"{type(outcome).__name__}: {outcome}",
+                        _exception_details(outcome),
+                    )
+            else:
+                group_results.append(outcome)
+
+        if failed_groups:
+            if log_fn:
+                log_fn(
+                    "WARNING",
+                    f"TTS batch co {len(failed_groups)} cum loi. Bat dau Recovery Queue; "
+                    "cac cum da thanh cong duoc giu nguyen.",
+                )
+            recovered_groups, remaining_groups, last_errors = loop.run_until_complete(
+                _recover_failed_tts_groups(
+                    failed_groups, rate, temp_dir, ffmpeg_exe, log_fn
+                )
+            )
+            group_results.extend(recovered_groups)
+
+            details = "; ".join(
+                f"cum {group_index + 1} (cau {', '.join(str(i + 1) for i, _ in items)})"
+                for group_index, (_, items), _ in remaining_groups
+            )
+            if not remaining_groups:
+                if log_fn:
+                    log_fn(
+                        "SUCCESS",
+                        f"TTS Recovery Queue da phuc hoi du {len(recovered_groups)} cum; tiep tuc render.",
+                    )
+            else:
+                final_details = "\n\n".join(
+                    f"Cum {group_index + 1}:\n{_exception_details(last_errors[group_index])}"
+                    for group_index, _, _ in remaining_groups
+                )
+                if log_fn:
+                    log_fn(
+                        "ERROR",
+                        f"TTS Recovery Queue van con loi sau {len(TTS_RECOVERY_DELAYS)} vong: {details}.",
+                        final_details,
+                    )
+                raise RuntimeError(
+                    f"Khong phuc hoi duoc TTS: {details}. "
+                    "Cac cum khac da duoc giu trong cache; co the tiep tuc lai sau."
+                )
     except Exception as exc:
         if log_fn:
             log_fn("ERROR", f"TTS batch dung do {type(exc).__name__}: {exc}", traceback.format_exc())
@@ -376,10 +1104,46 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
     print(f"[INFO] Hoan thanh tai TTS da luong.")
     
     # 3. Sap xep ket qua va tinh toan time tich luy (Cumulative time)
+    group_results.sort(key=lambda x: x[0])
+    results = []
+    continuous_group_paths = []
+    can_use_continuous_master = True
+    for _, item_results, group_path in group_results:
+        results.extend(item_results)
+        if group_path:
+            continuous_group_paths.append(group_path)
+        else:
+            can_use_continuous_master = False
     results.sort(key=lambda x: x[0])
+
+    # Keep the exact grouped takes for the master track. Sentence chunks remain
+    # available for visual timing and subtitle generation.
+    if can_use_continuous_master and continuous_group_paths:
+        concat_path = os.path.join(temp_dir, "continuous_tts_concat.txt")
+        with open(concat_path, "w", encoding="utf-8") as concat_file:
+            for path in continuous_group_paths:
+                absolute_path = os.path.abspath(path).replace(chr(92), "/")
+                concat_file.write(f"file '{absolute_path}'\n")
+        continuous_master = os.path.join(temp_dir, "continuous_master_tts.mp3")
+        concat_result = subprocess.run([
+            ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", concat_path,
+            "-c:a", "libmp3lame", "-q:a", "3", continuous_master,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if concat_result.returncode == 0 and os.path.getsize(continuous_master) > 1000:
+            master_duration = get_audio_duration(continuous_master)
+            planned_duration = sum(float(item[4]) for item in results if len(item) >= 5)
+            if master_duration > 0.05 and planned_duration > 0.05:
+                master_scale = master_duration / planned_duration
+                results = [
+                    (*item[:4], float(item[4]) * master_scale) if len(item) >= 5 else item
+                    for item in results
+                ]
+            with open(os.path.join(temp_dir, "_USE_MASTER_TTS_"), "w", encoding="utf-8") as marker:
+                marker.write(os.path.abspath(continuous_master))
     
     audio_paths = []
     durations = []
+    visual_word_cues = []
     srt_lines = []
     cumulative_time = 0.0
     
@@ -392,7 +1156,8 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
         if i not in res_dict:
             continue
             
-        _, r_type, chunk_path, submaker = res_dict[i]
+        result_item = res_dict[i]
+        _, r_type, chunk_path, submaker = result_item[:4]
         
         if r_type == "MISSING_SFX":
             continue
@@ -401,6 +1166,7 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
             sfx_dur = get_audio_duration(chunk_path)
             audio_paths.append(chunk_path)
             durations.append(sfx_dur)
+            visual_word_cues.append([])
             srt_lines.append((cumulative_time, cumulative_time + sfx_dur, ""))
             cumulative_time += sfx_dur
             continue
@@ -408,17 +1174,28 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
         if r_type == "EMPTY_TTS":
             audio_paths.append(chunk_path)
             durations.append(3.0)
+            visual_word_cues.append([])
             cumulative_time += 3.0
             continue
             
         # Truong hop TTS binh thuong
-        if submaker and submaker.cues:
+        if len(result_item) >= 5:
+            chunk_dur = float(result_item[4])
+        elif submaker and submaker.cues:
             chunk_dur = submaker.cues[-1].end.total_seconds()
         else:
             chunk_dur = max(2.0, len(s) * 0.07)
             
         audio_paths.append(chunk_path)
         durations.append(chunk_dur)
+        visual_word_cues.append([
+            {
+                "start": cue.start.total_seconds(),
+                "end": cue.end.total_seconds(),
+                "content": cue.content,
+            }
+            for cue in (submaker.cues if submaker and submaker.cues else [])
+        ])
         
         # Tao phu de tung tu (Karaoke / Hormozi)
         if submaker and submaker.cues:
@@ -466,6 +1243,8 @@ def generate_all_tts(sentences, default_voice, rate, temp_dir, options=None, log
             if text == "": continue
             f.write(f"Dialogue: 0,{format_timestamp_ass(start)},{format_timestamp_ass(end)},TikTokStyle,,0,0,0,,{text}\n")
             
+    if return_word_cues:
+        return audio_paths, durations, visual_word_cues
     return audio_paths, durations
 
 def format_timestamp(seconds):

@@ -31,6 +31,8 @@ temp_processing/
 temp_dir/
 temp_*/
 .scene_cache/
+.tts_cache/
+.jobs/
 _baseline*/
 *.ass
 *.srt

@@ -1,5 +1,6 @@
 import os
 import uuid
+import copy
 import threading
 import shutil
 import subprocess
@@ -7,23 +8,32 @@ import json
 import time
 import re
 import traceback
+import faulthandler
+import sys
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from google import genai
 import asyncio
 import edge_tts
 from tts_engine import (
     extract_time_range,
+    parse_sentences_and_visual_beats,
     parse_sentences_and_time_ranges,
     remove_non_story_timeline_rows,
     split_text_into_sentences,
 )
 from video_renderer import render_review_video_ffmpeg, export_capcut_package, generate_all_images, render_ai_image_video_ffmpeg
+from task_store import (
+    load_task_state,
+    save_task_payload,
+    save_task_state,
+)
 
 # =====================================================================
 # Cấu hình Môi trường
 # =====================================================================
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(WORKSPACE_DIR, "app_settings.json")
+LOG_DIR = os.path.join(WORKSPACE_DIR, "logs")
 
 # Tạo các thư mục cần thiết
 os.makedirs(os.path.join(WORKSPACE_DIR, "templates"), exist_ok=True)
@@ -32,6 +42,11 @@ os.makedirs(os.path.join(WORKSPACE_DIR, "static", "js"), exist_ok=True)
 os.makedirs(os.path.join(WORKSPACE_DIR, "static", "bgm"), exist_ok=True)
 os.makedirs(os.path.join(WORKSPACE_DIR, "static", "output"), exist_ok=True)
 os.makedirs(os.path.join(WORKSPACE_DIR, "static", "temp_preview"), exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Keep native Python crash information even when the web process disappears.
+_crash_log_handle = open(os.path.join(LOG_DIR, "python_crash.log"), "a", encoding="utf-8", buffering=1)
+faulthandler.enable(file=_crash_log_handle, all_threads=True)
 
 def _load_settings():
     try:
@@ -121,7 +136,7 @@ task_lock = threading.Lock()
 ALLOWED_VIDEO_EXT = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
 ALLOWED_AUDIO_EXT = {'.mp3', '.wav', '.m4a', '.ogg'}
 
-def create_task(project_id="", video_name=""):
+def create_task(project_id="", video_name="", persistent=False):
     task_id = str(uuid.uuid4())
     with task_lock:
         TASKS[task_id] = {
@@ -132,9 +147,44 @@ def create_task(project_id="", video_name=""):
             "project_id": project_id,
             "video_name": video_name,
             "created_at": __import__('time').time(),
-            "logs": []
+            "logs": [],
+            "persistent": bool(persistent),
         }
+        snapshot = copy.deepcopy(TASKS[task_id])
+    if persistent:
+        save_task_state(task_id, snapshot)
     return task_id
+
+
+def _persist_task_if_needed(task_id):
+    with task_lock:
+        task = TASKS.get(task_id)
+        snapshot = copy.deepcopy(task) if task and task.get("persistent") else None
+    if snapshot is not None:
+        save_task_state(task_id, snapshot)
+
+
+def update_task_fields(task_id, **fields):
+    """Update RAM state and atomically checkpoint persistent render state."""
+    with task_lock:
+        task = TASKS.setdefault(task_id, {"logs": [], "persistent": True})
+        task.update(fields)
+        snapshot = copy.deepcopy(task) if task.get("persistent") else None
+    if snapshot is not None:
+        save_task_state(task_id, snapshot)
+    return snapshot
+
+
+def restore_persistent_task(task_id, state):
+    restored = copy.deepcopy(state or {})
+    restored["persistent"] = True
+    restored.setdefault("logs", [])
+    with task_lock:
+        TASKS[task_id] = restored
+    save_task_state(task_id, restored)
+
+def _task_log_path(task_id):
+    return os.path.join(LOG_DIR, f"task_{task_id}.log")
 
 def append_task_log(task_id, level, message, details=""):
     """Store diagnostic events so the browser can show the real backend log."""
@@ -152,6 +202,18 @@ def append_task_log(task_id, level, message, details=""):
             # Prevent an unusually long run from growing memory forever.
             if len(task["logs"]) > 2000:
                 task["logs"] = task["logs"][-2000:]
+    _persist_task_if_needed(task_id)
+    # File log is deliberately independent from TASKS, which only lives in RAM.
+    # It therefore survives a Flask/VS Code crash and can be inspected afterward.
+    try:
+        with open(_task_log_path(task_id), "a", encoding="utf-8", newline="\n") as log_file:
+            log_file.write(f"[{entry['time']}] [{entry['level']}] {entry['message']}\n")
+            if details:
+                log_file.write(str(details).rstrip() + "\n")
+            log_file.flush()
+            os.fsync(log_file.fileno())
+    except OSError as log_error:
+        print(f"[LOG ERROR] Khong ghi duoc task log: {log_error}", flush=True)
     print(f"[{entry['time']}] [{entry['level']}] [task {task_id[:8]}] {entry['message']}", flush=True)
     if details:
         print(details, flush=True)
@@ -508,9 +570,15 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"- Không kéo timeline tới cuối file nếu sau câu chuyện chỉ còn credit hoặc màn hình kết.\n\n"
             
             f"=== TIMESTAMP (CHÍNH XÁC) ===\n"
-            f"- MỖI CỤM HÀNH ĐỘNG phải bắt đầu bằng [TIME=mm:ss-mm:ss]: vùng hình ảnh chứng minh đúng hành động đang kể.\n"
-            f"- MỖI mốc [TIME=] phải bắt đầu ở MỘT DÒNG MỚI; không ghép hai mốc trên cùng một dòng.\n"
+            f"- Giữ mỗi câu kể tự nhiên trong MỘT dòng để TTS đọc liền mạch.\n"
+            f"- Cảnh đầu câu dùng [TIME=START-END]. Nếu cùng câu xuất hiện hành động mới, chèn [BEAT=START-END] ngay trước cụm từ mô tả hành động đó.\n"
+            f"- Ví dụ: [TIME=01:20-01:24] Luke nhặt mảnh xương lên, [BEAT=01:27-01:31] rồi phát hiện dấu chân gấu trên cát.\n"
+            f"- [BEAT] chỉ điều khiển hình ảnh, không được làm cắt vụn câu văn hoặc lặp lại lời kể.\n"
+            f"- MỖI CỤM HÀNH ĐỘNG phải có [TIME=mm:ss-mm:ss] hoặc [BEAT=mm:ss-mm:ss]: vùng hình ảnh chứng minh đúng hành động đang kể.\n"
+            f"- Mỗi [TIME=] bắt đầu MỘT câu kể mới; [BEAT=] nằm trong câu đó tại đúng chỗ lời kể chuyển sang hành động mới.\n"
             f"- Một cụm được phép có 1-3 câu tự nhiên nếu chúng cùng nhân vật, cùng sự kiện và diễn ra liên tiếp.\n"
+            f"- Một range chỉ nên chứa MỘT hành động hình ảnh chính. Nếu lời kể có hai hành động liên tiếp, phải tách thành hai range START-END liên tiếp.\n"
+            f"- Không chia quá 2 range cho một câu và không tạo range ngắn hơn 1,5 giây, trừ montage hành động nhanh.\n"
             f"- Không tách một ý đang liền mạch thành nhiều câu cụt chỉ để ép vừa số giây.\n"
             f"- Không dùng chung một timestamp cho nhiều hành động khác nhau nếu chúng xảy ra ở thời điểm khác nhau.\n"
             f"- START phải nhỏ hơn END; range sau không được đi lùi hoặc chồng lên range trước.\n"
@@ -534,7 +602,7 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"- CẤM bịa sự kiện không có trong video.\n"
             f"- CẤM gọi sai tên mob/vật phẩm.\n\n"
             
-            f"NHẮC LẠI: MỖI CỤM HÀNH ĐỘNG phải có [TIME=START-END], lời kể đầy đủ và tự nhiên. Tuyệt đối không kể logo/credit.\n"
+            f"NHẮC LẠI: Mỗi câu dùng [TIME=START-END] cho cảnh đầu và [BEAT=START-END] cho các hành động tiếp theo; lời kể vẫn phải đầy đủ, tự nhiên. Tuyệt đối không kể logo/credit.\n"
             f"{custom_section}"
             f"Bây giờ hãy viết kịch bản:"
         )
@@ -679,16 +747,15 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
 
 def render_video_bg(task_id, input_video_name, bgm_name, bgm_volume, voice_name, voice_rate, sentences, options, export_mode):
     def update_prog(prog, msg):
-        with task_lock:
-            TASKS[task_id]["progress"] = prog
-            TASKS[task_id]["message"] = msg
+        update_task_fields(task_id, progress=prog, message=msg, heartbeat_at=time.time())
         append_task_log(task_id, "STEP", f"{prog}% - {msg}")
 
     def diagnostic_log(level, message, details=""):
         append_task_log(task_id, level, message, details)
 
     try:
-        diagnostic_log("INFO", f"Bat dau render: mode={export_mode}, video={input_video_name}, so_dong={len(sentences)}, voice={voice_name}, rate={voice_rate}")
+        diagnostic_log("INFO", f"Bat dau render: mode={export_mode}, video={input_video_name}, so_dong={len(sentences)}, voice={voice_name}, rate={voice_rate}, pid={os.getpid()}")
+        diagnostic_log("INFO", f"Nhat ky day du: {_task_log_path(task_id)}")
         input_video_path = os.path.join(WORKSPACE_DIR, input_video_name)
         
         bgm_path = ""
@@ -723,13 +790,16 @@ def render_video_bg(task_id, input_video_name, bgm_name, bgm_volume, voice_name,
             )
 
         export_path, export_error = copy_result_to_export_directory(res_url)
-        with task_lock:
-            TASKS[task_id]["status"] = "success"
-            TASKS[task_id]["progress"] = 100
-            TASKS[task_id]["message"] = "Xuất video thành công!"
-            TASKS[task_id]["result"] = res_url
-            TASKS[task_id]["export_path"] = export_path
-            TASKS[task_id]["export_error"] = export_error
+        update_task_fields(
+            task_id,
+            status="success",
+            progress=100,
+            message="Xuất video thành công!",
+            result=res_url,
+            export_path=export_path,
+            export_error=export_error,
+            heartbeat_at=time.time(),
+        )
 
     except Exception as e:
         error_trace = traceback.format_exc()
@@ -742,9 +812,14 @@ def render_video_bg(task_id, input_video_name, bgm_name, bgm_volume, voice_name,
             err_msg = "Loi tao giong doc AI. Kiem tra ket noi internet va thu lai."
         elif "genai" in err_msg.lower() or "api" in err_msg.lower():
             err_msg = "Loi ket noi API Gemini. Kiem tra API Key va thu lai."
-        with task_lock:
-            TASKS[task_id]["status"] = "failed"
-            TASKS[task_id]["message"] = f"Loi: {err_msg}"
+        update_task_fields(
+            task_id,
+            status="failed",
+            message=f"Loi: {err_msg}",
+            heartbeat_at=time.time(),
+        )
+    finally:
+        diagnostic_log("INFO", "Tac vu render da ket thuc khoi worker (thanh cong hoac that bai).")
 
 # =====================================================================
 # FLASK ROUTING & API ENDPOINTS
@@ -752,6 +827,13 @@ def render_video_bg(task_id, input_video_name, bgm_name, bgm_volume, voice_name,
 @app.route("/")
 def index():
     return render_template("index.html", default_key=DEFAULT_API_KEY)
+
+@app.route("/source-video/<path:filename>")
+def source_video(filename):
+    """Serve an uploaded source video stored at the workspace root."""
+    if os.path.splitext(filename)[1].lower() not in ALLOWED_VIDEO_EXT:
+        return jsonify({"success": False, "message": "Dinh dang video khong hop le."}), 404
+    return send_from_directory(WORKSPACE_DIR, filename)
 
 @app.route("/api/export-directory", methods=["GET", "POST"])
 def export_directory():
@@ -996,6 +1078,10 @@ def render_video():
     voice_name = data.get("voice_name", "vi-VN-HoaiMyNeural")
     voice_rate = data.get("voice_rate", "-10%")
     sentences = data.get("sentences", [])
+    # Repair stale/browser timelines before persisting a render payload. Older
+    # parsers collapsed timestamps beyond 99:59 into one oversized TTS item.
+    if isinstance(sentences, list) and sentences:
+        sentences = split_text_into_sentences("\n".join(str(item) for item in sentences))
     project_id = str(data.get("project_id", "")).strip()
     review_minutes_raw = data.get("review_minutes", "auto")
     
@@ -1018,7 +1104,7 @@ def render_video():
     if str(review_minutes_raw).lower() != "auto":
         review_minutes = max(3, min(20, int(review_minutes_raw)))
         options["review_minutes"] = review_minutes
-        spoken_text = re.sub(r'\[(?:TIME|VOICE|SFX)=[^\]]+\]|<(?:VOICE|SFX)=[^>]+>', ' ', ' '.join(sentences), flags=re.IGNORECASE)
+        spoken_text = re.sub(r'\[(?:TIME|BEAT|VOICE|SFX)=[^\]]+\]|<(?:VOICE|SFX)=[^>]+>', ' ', ' '.join(sentences), flags=re.IGNORECASE)
         spoken_words = len(spoken_text.split())
         max_render_words = int(review_minutes * 150 * 1.20)
         if spoken_words > max_render_words:
@@ -1035,11 +1121,21 @@ def render_video():
     if not sentences:
         return jsonify({"success": False, "message": "Kịch bản trống."})
 
-    clean_timeline, range_starts, range_ends = parse_sentences_and_time_ranges(sentences)
+    clean_timeline, range_starts, range_ends, visual_groups = parse_sentences_and_visual_beats(sentences)
     previous_end = -1.0
-    for index, (text, start, end) in enumerate(zip(clean_timeline, range_starts, range_ends), start=1):
+    validation_beats = []
+    for index, (text, groups) in enumerate(zip(clean_timeline, visual_groups), start=1):
         if text.startswith(("<VOICE=", "<SFX=")):
             continue
+        if groups:
+            validation_beats.extend(
+                (index, beat["text"], beat.get("start"), beat.get("end"))
+                for beat in groups
+            )
+        else:
+            validation_beats.append((index, text, range_starts[index - 1], range_ends[index - 1]))
+
+    for index, text, start, end in validation_beats:
         if start is None or end is None:
             return jsonify({
                 "success": False,
@@ -1067,28 +1163,93 @@ def render_video():
         }), 409
     with task_lock:
         project = PROJECTS.get(project_id)
+        if project is None and os.path.isfile(os.path.join(WORKSPACE_DIR, video_name)):
+            # A server restart clears RAM-only project metadata. The browser
+            # still owns the validated script/project id, so restore the local
+            # project instead of forcing an expensive Gemini regeneration.
+            project = {
+                "video_name": video_name,
+                "analysis_task_id": "restored-for-render",
+                "created_at": time.time(),
+            }
+            PROJECTS[project_id] = project
     if not project or project.get("video_name") != video_name:
         return jsonify({
             "success": False,
             "message": "Video va kich ban khong cung mot phien. Hay tao lai kich ban cho video dang chon."
         }), 409
 
-    task_id = create_task(project_id, video_name)
+    task_id = create_task(project_id, video_name, persistent=True)
 
     export_mode = data.get("export_mode", "full_mp4")
-    
-    # Chạy tiểu trình render nền
-    thread = threading.Thread(
-        target=render_video_bg,
-        args=(task_id, video_name, bgm_name, bgm_volume, voice_name, voice_rate, sentences, options, export_mode)
-    )
-    thread.daemon = True
-    thread.start()
+
+    # Save inputs first, then launch a detached worker. Rendering is no longer
+    # owned by Flask's lifetime, so a web-server restart cannot kill the job.
+    save_task_payload(task_id, {
+        "video_name": video_name,
+        "bgm_name": bgm_name,
+        "bgm_volume": bgm_volume,
+        "voice_name": voice_name,
+        "voice_rate": voice_rate,
+        "sentences": sentences,
+        "options": options,
+        "export_mode": export_mode,
+    })
+    worker_script = os.path.join(WORKSPACE_DIR, "render_worker.py")
+    worker_log_path = os.path.join(LOG_DIR, f"worker_{task_id}.log")
+    worker_log = open(worker_log_path, "a", encoding="utf-8", buffering=1)
+    popen_kwargs = {
+        "cwd": WORKSPACE_DIR,
+        "stdin": subprocess.DEVNULL,
+        "stdout": worker_log,
+        "stderr": worker_log,
+        "close_fds": True,
+        "env": {**os.environ, "PYTHONUTF8": "1"},
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, worker_script, task_id], **popen_kwargs)
+    except Exception as exc:
+        update_task_fields(
+            task_id,
+            status="failed",
+            message=f"Khong khoi dong duoc worker render: {exc}",
+        )
+        return jsonify({"success": False, "message": str(exc)}), 500
+    finally:
+        worker_log.close()
     
     return jsonify({"success": True, "task_id": task_id})
 
 @app.route("/api/task-status/<task_id>", methods=["GET"])
 def task_status(task_id):
+    persisted = load_task_state(task_id)
+    if persisted is not None:
+        heartbeat_at = float(persisted.get("heartbeat_at") or persisted.get("created_at") or 0)
+        if persisted.get("status") in ("queued", "running") and time.time() - heartbeat_at > 30:
+            worker_pid = int(persisted.get("worker_pid") or 0)
+            worker_alive = False
+            if worker_pid > 0:
+                try:
+                    os.kill(worker_pid, 0)
+                    worker_alive = True
+                except (OSError, ProcessLookupError, PermissionError):
+                    worker_alive = False
+            if not worker_alive:
+                persisted.update({
+                    "status": "failed",
+                    "message": "Worker render da dung dot ngot. Bam Thu lai de tiep tuc tu cache TTS.",
+                })
+                save_task_state(task_id, persisted)
+        with task_lock:
+            TASKS[task_id] = persisted
+        return jsonify(persisted)
+
     with task_lock:
         task = TASKS.get(task_id)
         
@@ -1200,4 +1361,4 @@ def api_generate_ai_video():
 
 if __name__ == "__main__":
     print("[*] Server is running at http://127.0.0.1:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

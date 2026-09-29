@@ -7,8 +7,10 @@ import pathlib
 import concurrent.futures
 from tts_engine import (
     create_srt,
+    expand_visual_beats,
     generate_all_tts,
     get_audio_duration,
+    parse_sentences_and_visual_beats,
     parse_sentences_and_time_ranges,
     split_text_into_sentences,
 )
@@ -41,6 +43,32 @@ def get_video_info(input_video_path):
         w_vid, h_vid = int(res_match.group(1)), int(res_match.group(2))
     
     return duration, w_vid, h_vid
+
+
+def _remove_voice_control_rows(sentences, starts, ends):
+    """Voice tags control TTS but must never occupy a visual timeline slot."""
+    kept = [
+        index for index, sentence in enumerate(sentences)
+        if not sentence.strip().upper().startswith("<VOICE=")
+    ]
+    return (
+        [sentences[index] for index in kept],
+        [starts[index] for index in kept],
+        [ends[index] for index in kept],
+    )
+
+
+def _require_exact_audio_alignment(sentences, audio_paths, durations):
+    if not (len(sentences) == len(audio_paths) == len(durations)):
+        raise RuntimeError(
+            "So luong audio khong khop timeline "
+            f"(canh={len(sentences)}, audio={len(audio_paths)}, duration={len(durations)})."
+        )
+    for index, (path, duration) in enumerate(zip(audio_paths, durations), start=1):
+        if not path or not os.path.isfile(path) or float(duration) <= 0.05:
+            raise RuntimeError(f"Audio cau {index} khong hop le; dung render de tranh lech canh.")
+
+
 def _pause_duration_for_text(text):
     """Return a small, controlled pause without creating robotic one-second gaps."""
     text = (text or "").rstrip()
@@ -109,24 +137,27 @@ def build_visual_edit_plan(
             "playback_speed": playback_speed,
             "has_range": has_range,
         })
+
+    # Do not let one long spoken beat consume frames owned by the next action;
+    # otherwise the next segment starts earlier and visibly replays footage.
+    for index in range(len(plan) - 1):
+        next_start = starts[index + 1] if starts and index + 1 < len(starts) else None
+        if next_start is None:
+            continue
+        available = float(next_start) - float(plan[index]["source_start"])
+        if available > 0.05 and plan[index]["source_duration"] > available:
+            plan[index]["source_duration"] = available
+            plan[index]["playback_speed"] = available / plan[index]["output_duration"]
     return plan
 
 
 def trim_silence_from_audio(input_path, output_path, pause_duration=0.15):
-    """Trim only the outer TTS silence, preserve pauses inside speech, then add a short pause."""
+    """Preserve speech exactly; grouped TTS already owns its natural pauses."""
     ffmpeg_exe = get_ffmpeg_exe()
-    # Reversing before the second silenceremove trims the tail only. A single
-    # silenceremove with stop_periods could cut at a natural pause in the middle.
-    audio_filter = (
-        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-42dB,"
-        "areverse,"
-        "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-42dB,"
-        "areverse,"
-        f"apad=pad_dur={max(0.0, float(pause_duration)):.3f}"
-    )
+    # Amplitude-based trimming used to remove quiet Vietnamese final consonants.
+    # Service padding is bounded from the final SubMaker cue during generation.
     result = subprocess.run([
         ffmpeg_exe, "-y", "-i", input_path,
-        "-af", audio_filter,
         "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1",
         output_path
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -287,7 +318,7 @@ def _step1_prefilter_video(input_video_path, filtered_path, options, w_vid, h_vi
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_video, speed_factor, timestamps=None, end_timestamps=None, scenes=None, assigned_scenes=None, options=None, audio_paths=None):
+def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_video, speed_factor, timestamps=None, end_timestamps=None, scenes=None, assigned_scenes=None, options=None, audio_paths=None, diagnostic_log=None):
     """
     Buoc 2: Cat tung phan canh.
     
@@ -546,7 +577,7 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
     grouped_jobs = []
     for job in segment_jobs:
         index, start, source_duration, output_duration, video_filter, path = job
-        if grouped_jobs:
+        if grouped_jobs and not ranged_plan:
             prev_index, prev_start, prev_source_duration, prev_output_duration, prev_filter, prev_path = grouped_jobs[-1]
             source_gap = abs(start - (prev_start + prev_source_duration))
             # Only merge truly contiguous source playback. A larger tolerance
@@ -594,10 +625,17 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         nvenc = common + [
             "-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "10M", path,
         ]
-        result = subprocess.run(nvenc, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(nvenc, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
         if result.returncode != 0:
+            if diagnostic_log:
+                diagnostic_log("WARNING", f"FFmpeg NVENC segment {index} that bai (code {result.returncode}); chuyen sang CPU.", (result.stderr or "")[-8000:])
             cpu = common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", path]
-            subprocess.run(cpu, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            cpu_result = subprocess.run(cpu, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+            if cpu_result.returncode != 0:
+                details = (cpu_result.stderr or "")[-12000:]
+                if diagnostic_log:
+                    diagnostic_log("ERROR", f"FFmpeg CPU segment {index} that bai (code {cpu_result.returncode}).", details)
+                raise RuntimeError(f"FFmpeg khong render duoc segment {index}; exit code {cpu_result.returncode}. Chi tiet trong task log.")
         if not os.path.exists(path) or os.path.getsize(path) < 500:
             raise RuntimeError(f"Khong the render segment {index}")
         return path
@@ -608,7 +646,7 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         segment_paths = list(pool.map(render_segment, segment_jobs))
     return segment_paths
 
-def _step3_concat_segments(segment_paths, output_path, temp_dir):
+def _step3_concat_segments(segment_paths, output_path, temp_dir, diagnostic_log=None):
     """Buoc 3: Noi tat ca phan canh (concat demuxer)."""
     ffmpeg_exe = get_ffmpeg_exe()
     
@@ -625,9 +663,13 @@ def _step3_concat_segments(segment_paths, output_path, temp_dir):
         "-c", "copy",
         output_path
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+    if result.returncode != 0:
+        if diagnostic_log:
+            diagnostic_log("ERROR", f"FFmpeg noi video that bai (code {result.returncode}).", (result.stderr or "")[-12000:])
+        raise RuntimeError(f"FFmpeg noi video that bai; exit code {result.returncode}. Chi tiet trong task log.")
 
-def create_master_video_raw(input_video_path, output_path, sentences, durations, options, update_fn=None, timestamps=None, end_timestamps=None, audio_paths=None):
+def create_master_video_raw(input_video_path, output_path, sentences, durations, options, update_fn=None, timestamps=None, end_timestamps=None, audio_paths=None, diagnostic_log=None):
     """Pipeline: Gemini time ranges -> cut continuous source segments -> concat."""
     D_video, w_vid, h_vid = get_video_info(input_video_path)
     speed_factor = float(options.get("speed_factor", 1.0))
@@ -651,13 +693,13 @@ def create_master_video_raw(input_video_path, output_path, sentences, durations,
         update_fn(70, f"Buoc 2/3: Dang cat {len(sentences)} phan canh ({mode})...")
     segment_paths = _step2_cut_segments(
         input_video_path, temp_dir, sentences, durations, D_video, speed_factor, 
-        timestamps, end_timestamps, scenes, assigned_scenes, render_options, None
+        timestamps, end_timestamps, scenes, assigned_scenes, render_options, None, diagnostic_log
     )
     
     # Buoc 3: Noi cac phan canh
     if update_fn:
         update_fn(80, "Buoc 3/3: Dang noi cac phan canh thanh video hoan chinh...")
-    _step3_concat_segments(segment_paths, output_path, temp_dir)
+    _step3_concat_segments(segment_paths, output_path, temp_dir, diagnostic_log)
     
     # Don dep file trung gian
     try:
@@ -689,8 +731,8 @@ def _cleanup_old_outputs(output_dir, max_files=3):
         pass
 
 
-def fit_tts_to_time_ranges(audio_paths, durations, starts, ends, temp_dir, max_speed=1.10):
-    """Gently shorten overflowing narration; never cut speech or exceed max_speed."""
+def fit_tts_to_time_ranges(audio_paths, durations, starts, ends, temp_dir, max_speed=1.0):
+    """Keep narration cadence stable; visual ranges adapt to the spoken audio."""
     if not starts or not ends:
         return list(audio_paths), list(durations), False
     ffmpeg_exe = get_ffmpeg_exe()
@@ -729,18 +771,38 @@ def fit_tts_to_time_ranges(audio_paths, durations, starts, ends, temp_dir, max_s
                 f"[+] TTS cau {index + 1}: tang toc nhe {factor:.3f}x "
                 f"({duration:.2f}s -> {fitted_durations[index]:.2f}s)."
             )
+    if adjusted:
+        # The continuous master has the original tempo. Rebuild from adjusted
+        # chunks whenever at least one beat needed a speed correction.
+        marker_path = os.path.join(temp_dir, "_USE_MASTER_TTS_")
+        try:
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+        except OSError:
+            pass
     return fitted_paths, fitted_durations, adjusted
 
 def export_capcut_package(task_id, input_video_path, bgm_path, bgm_volume, voice_name, voice_rate, sentences, options, update_status_fn, diagnostic_log=None):
     temp_dir = os.path.join(os.path.dirname(input_video_path), f"temp_{task_id}")
     os.makedirs(temp_dir, exist_ok=True)
     
-    clean_sentences, timestamps, end_timestamps = parse_sentences_and_time_ranges(sentences)
+    clean_sentences, timestamps, end_timestamps, visual_groups = parse_sentences_and_visual_beats(sentences)
     
     try:
         # 1. TTS (SubMaker: giong doc lien mach + timing chinh xac)
         update_status_fn(10, "Đang tổng hợp giọng nói AI (TTS SubMaker)...")
-        audio_paths, durations = generate_all_tts(clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log)
+        audio_paths, durations, word_cues = generate_all_tts(
+            clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log,
+            return_word_cues=True,
+        )
+        visual_groups = [
+            group for sentence, group in zip(clean_sentences, visual_groups)
+            if not sentence.startswith("<VOICE=")
+        ]
+        clean_sentences, timestamps, end_timestamps = _remove_voice_control_rows(
+            clean_sentences, timestamps, end_timestamps
+        )
+        _require_exact_audio_alignment(clean_sentences, audio_paths, durations)
         audio_paths, durations, tts_adjusted = fit_tts_to_time_ranges(
             audio_paths, durations, timestamps, end_timestamps, temp_dir
         )
@@ -770,7 +832,10 @@ def export_capcut_package(task_id, input_video_path, bgm_path, bgm_volume, voice
         # 4. Master Video Raw (Pipeline 3 buoc sieu toc)
         update_status_fn(50, "Dang xu ly hinh anh lach ban quyen (Pipeline 3 buoc)...")
         master_video_path = os.path.join(temp_dir, "master_video_raw.mp4")
-        create_master_video_raw(input_video_path, master_video_path, clean_sentences, durations, options, update_fn=update_status_fn, timestamps=timestamps, end_timestamps=end_timestamps, audio_paths=audio_paths)
+        visual_sentences, visual_durations, visual_starts, visual_ends = expand_visual_beats(
+            clean_sentences, durations, visual_groups, word_cues
+        )
+        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, audio_paths=None, diagnostic_log=diagnostic_log)
         
         # 5. Zip it up
         update_status_fn(90, "Đang đóng gói ZIP cho CapCut...")
@@ -795,11 +860,22 @@ def render_review_video_ffmpeg(task_id, input_video_path, bgm_path, bgm_volume, 
     temp_dir = os.path.join(os.path.dirname(input_video_path), f"temp_{task_id}")
     os.makedirs(temp_dir, exist_ok=True)
     
-    clean_sentences, timestamps, end_timestamps = parse_sentences_and_time_ranges(sentences)
+    clean_sentences, timestamps, end_timestamps, visual_groups = parse_sentences_and_visual_beats(sentences)
     
     try:
         update_status_fn(10, "Đang tổng hợp giọng nói AI (TTS SubMaker)...")
-        audio_paths, durations = generate_all_tts(clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log)
+        audio_paths, durations, word_cues = generate_all_tts(
+            clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log,
+            return_word_cues=True,
+        )
+        visual_groups = [
+            group for sentence, group in zip(clean_sentences, visual_groups)
+            if not sentence.startswith("<VOICE=")
+        ]
+        clean_sentences, timestamps, end_timestamps = _remove_voice_control_rows(
+            clean_sentences, timestamps, end_timestamps
+        )
+        _require_exact_audio_alignment(clean_sentences, audio_paths, durations)
         audio_paths, durations, tts_adjusted = fit_tts_to_time_ranges(
             audio_paths, durations, timestamps, end_timestamps, temp_dir
         )
@@ -827,7 +903,15 @@ def render_review_video_ffmpeg(task_id, input_video_path, bgm_path, bgm_volume, 
         
         update_status_fn(50, "Dang xu ly hinh anh lach ban quyen (Pipeline 3 buoc)...")
         master_video_path = os.path.join(temp_dir, "master_video_raw.mp4")
-        create_master_video_raw(input_video_path, master_video_path, clean_sentences, durations, options, update_fn=update_status_fn, timestamps=timestamps, end_timestamps=end_timestamps, audio_paths=audio_paths)
+        visual_sentences, visual_durations, visual_starts, visual_ends = expand_visual_beats(
+            clean_sentences, durations, visual_groups, word_cues
+        )
+        if diagnostic_log:
+            diagnostic_log(
+                "INFO",
+                f"Audio-led visual beats: {len(clean_sentences)} cau noi -> {len(visual_sentences)} canh hanh dong.",
+            )
+        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, audio_paths=None, diagnostic_log=diagnostic_log)
         
         update_status_fn(80, "Dang nung phu de vao video (Hardsub)...")
         output_filename = f"video_review_{task_id}.mp4"
@@ -921,11 +1005,17 @@ def render_review_video_ffmpeg(task_id, input_video_path, bgm_path, bgm_volume, 
             ]
             cmd_sub_cpu = cmd_sub
         
-        res = subprocess.run(cmd_sub, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=os.path.dirname(input_video_path))
+        res = subprocess.run(cmd_sub, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", cwd=os.path.dirname(input_video_path))
         if res.returncode != 0:
+            if diagnostic_log:
+                diagnostic_log("WARNING", f"FFmpeg xuat video lan dau that bai (code {res.returncode}); dang thu CPU.", (res.stderr or "")[-12000:])
             # This command really is CPU fallback (the previous implementation
             # accidentally retried NVENC and failed again on machines without it).
-            subprocess.run(cmd_sub_cpu, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, cwd=os.path.dirname(input_video_path))
+            cpu_res = subprocess.run(cmd_sub_cpu, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", cwd=os.path.dirname(input_video_path))
+            if cpu_res.returncode != 0:
+                if diagnostic_log:
+                    diagnostic_log("ERROR", f"FFmpeg xuat video CPU that bai (code {cpu_res.returncode}).", (cpu_res.stderr or "")[-12000:])
+                raise RuntimeError(f"FFmpeg xuat video that bai; exit code {cpu_res.returncode}. Chi tiet trong task log.")
         
         # Don dep file SRT tam
         try:

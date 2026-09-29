@@ -946,6 +946,7 @@ async function startRenderVideo() {
         if (state.projectId !== renderingProjectId || state.selectedVideo !== renderingVideo) return;
         
         if (data.success) {
+            localStorage.setItem('active_render_task_id', data.task_id);
             pollTaskStatus(data.task_id, (statusData) => {
                 if (state.projectId !== renderingProjectId || state.selectedVideo !== renderingVideo) return;
                 // Cap nhat tien do render
@@ -971,6 +972,7 @@ async function startRenderVideo() {
                 renderedBackendLogCount = backendLogs.length;
                 dom.renderLogTerminal.scrollTop = dom.renderLogTerminal.scrollHeight;
             }, (videoUrl, taskData) => {
+                localStorage.removeItem('active_render_task_id');
                 if (state.projectId !== renderingProjectId || state.selectedVideo !== renderingVideo) return;
                 // Render thanh cong!
                 stopRenderTimer();
@@ -1002,10 +1004,11 @@ async function startRenderVideo() {
                     showToast('Video đã render nhưng chưa chép được: ' + taskData.export_error, 'error');
                 }
             }, (errMessage) => {
+                localStorage.removeItem('active_render_task_id');
                 if (state.projectId !== renderingProjectId || state.selectedVideo !== renderingVideo) return;
                 stopRenderTimer();
                 dom.btnStartRender.disabled = false;
-                dom.btnStartRender.innerHTML = '<i class="fa-solid fa-circle-play"></i> BẮT ĐẦU XUẤT VIDEO REVIEW';
+                dom.btnStartRender.innerHTML = '<i class="fa-solid fa-rotate-right"></i> THỬ LẠI / TIẾP TỤC XUẤT VIDEO';
                 dom.btnRenderBack.disabled = false;
                 showToast(errMessage, 'error');
             });
@@ -1029,6 +1032,78 @@ async function startRenderVideo() {
 // =====================================================================
 // POLLING GENERAL SYSTEM TASK
 // =====================================================================
+async function resumePersistedRender() {
+    const taskId = localStorage.getItem('active_render_task_id');
+    if (!taskId) return;
+
+    try {
+        const response = await fetch(`/api/task-status/${taskId}`);
+        const task = await response.json();
+        if (task.status === 'not_found') {
+            localStorage.removeItem('active_render_task_id');
+            return;
+        }
+
+        state.projectId = task.project_id || state.projectId || createProjectId();
+        state.selectedVideo = task.video_name || state.selectedVideo;
+        state.highestStepReached = 5;
+        switchPanel(5);
+        dom.renderProgressBox.classList.remove('hidden');
+        dom.btnStartRender.disabled = true;
+        dom.btnRenderBack.disabled = true;
+        dom.btnStartRender.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> ĐANG TIẾP TỤC XỬ LÝ...';
+        dom.renderLogTerminal.innerHTML = '';
+        startRenderTimer();
+        let shownLogCount = 0;
+
+        const showProgress = (statusData) => {
+            dom.renderStatusPercent.textContent = `${statusData.progress || 0}%`;
+            dom.renderProgressFill.style.width = `${statusData.progress || 0}%`;
+            dom.renderStatusLbl.textContent = statusData.message || 'Worker đang xử lý...';
+            const logs = Array.isArray(statusData.logs) ? statusData.logs : [];
+            logs.slice(shownLogCount).forEach(entry => {
+                const line = document.createElement('div');
+                line.className = `log-line ${entry.level === 'ERROR' ? 'text-red' : (entry.level === 'SUCCESS' ? 'text-green' : '')}`;
+                line.textContent = `[${entry.time}] [${entry.level || 'INFO'}] ${entry.message}`;
+                dom.renderLogTerminal.appendChild(line);
+            });
+            shownLogCount = logs.length;
+            dom.renderLogTerminal.scrollTop = dom.renderLogTerminal.scrollHeight;
+        };
+
+        pollTaskStatus(taskId, showProgress, (videoUrl, taskData) => {
+            localStorage.removeItem('active_render_task_id');
+            stopRenderTimer();
+            dom.btnStartRender.disabled = false;
+            dom.btnRenderBack.disabled = false;
+            dom.btnStartRender.innerHTML = '<i class="fa-solid fa-circle-play"></i> BẮT ĐẦU XUẤT VIDEO REVIEW';
+            dom.videoPreviewPlaceholder.classList.add('hidden');
+            dom.videoPreviewWrapper.classList.remove('hidden');
+            dom.btnDownloadVideo.href = videoUrl;
+            if (videoUrl.endsWith('.zip')) {
+                dom.finalVideoPlayer.style.display = 'none';
+                dom.btnDownloadVideo.innerHTML = '<i class="fa-solid fa-file-zipper"></i> TẢI GÓI NGUYÊN LIỆU CAPCUT (ZIP)';
+            } else {
+                dom.finalVideoPlayer.style.display = 'block';
+                dom.finalVideoPlayer.src = videoUrl;
+                dom.finalVideoPlayer.load();
+                dom.btnDownloadVideo.innerHTML = '<i class="fa-solid fa-circle-down"></i> TẢI VIDEO REVIEW NGAY (MP4)';
+            }
+            showToast('Đã khôi phục và hoàn thành tác vụ xuất video.', 'success');
+        }, (message) => {
+            localStorage.removeItem('active_render_task_id');
+            stopRenderTimer();
+            dom.btnStartRender.disabled = false;
+            dom.btnRenderBack.disabled = false;
+            dom.btnStartRender.innerHTML = '<i class="fa-solid fa-rotate-right"></i> THỬ LẠI / TIẾP TỤC XUẤT VIDEO';
+            showToast(message, 'error');
+        });
+    } catch (error) {
+        // Keep the id: the web server may still be restarting while the worker runs.
+        showToast('Chưa kết nối lại được giao diện. Tác vụ render vẫn được giữ để thử lại.', 'error');
+    }
+}
+
 function pollTaskStatus(taskId, onProgress, onSuccess, onError) {
     let errorCount = 0;
     const timer = setInterval(async () => {
@@ -1036,8 +1111,11 @@ function pollTaskStatus(taskId, onProgress, onSuccess, onError) {
             const res = await fetch(`/api/task-status/${taskId}`);
             const data = await res.json();
             
-            // Reset error count on successful connection
+            const recoveredAfterDisconnect = errorCount >= 3;
             errorCount = 0;
+            if (recoveredAfterDisconnect) {
+                showToast('Đã kết nối lại máy chủ. Worker vẫn tiếp tục công việc.', 'success');
+            }
             
             if (data.status === 'success') {
                 clearInterval(timer);
@@ -1055,9 +1133,10 @@ function pollTaskStatus(taskId, onProgress, onSuccess, onError) {
             }
         } catch (err) {
             errorCount++;
-            if (errorCount >= 3) {
-                clearInterval(timer);
-                onError('Mất kết nối tới máy chủ quá nhiều lần. Vui lòng tải lại trang.');
+            // Do not declare the render failed just because Flask is temporarily
+            // unavailable. The detached worker may still be rendering normally.
+            if (errorCount === 3) {
+                showToast('Tạm mất kết nối giao diện; worker vẫn tiếp tục chạy. Đang tự kết nối lại…', 'error');
             }
         }
     }, 2000);
@@ -1271,7 +1350,7 @@ function setupEventListeners() {
 // DOCUMENT ON READY
 // =====================================================================
 document.addEventListener('DOMContentLoaded', () => {
-    loadInitialData();
+    loadInitialData().then(resumePersistedRender);
     loadSfxList();
     loadExportDirectory();
     setupEventListeners();
@@ -1363,7 +1442,8 @@ function updateSubtitlePreviewBackground(videoFilename) {
     
     // Fallback neu compressed chua co
     tempVideo.onerror = function() {
-        tempVideo.src = `/static/videos/${videoFilename}`; 
+        tempVideo.onerror = null;
+        tempVideo.src = `/source-video/${encodeURIComponent(videoFilename)}`;
     };
 
     tempVideo.currentTime = 2.0; // Seek đến giây thứ 2 để lấy hình
