@@ -253,6 +253,57 @@ def _hard_limit_timestamp_script(script_text, max_words):
     return " ".join(compacted[:max_words])
 
 
+def calculate_script_budget(video_duration_min, review_minutes="auto", style="dramatic"):
+    """Return one predictable recap budget for every source duration."""
+    video_duration_min = max(1.0, float(video_duration_min))
+    if review_minutes == "auto":
+        # One rule for every video: recap 20% of the source, capped at 20 minutes.
+        target_review_min = min(20.0, max(1.5, video_duration_min * 0.20))
+    else:
+        target_review_min = min(float(review_minutes), video_duration_min)
+
+    words_per_minute = 130 if str(style).lower() == "shorts" else 150
+    minimum_words = 150 if words_per_minute == 130 else 250
+    target_word_count = max(minimum_words, int(target_review_min * words_per_minute))
+    min_word_count = max(100 if words_per_minute == 130 else 200, int(target_word_count * 0.8))
+    max_word_count = int(target_word_count * 1.12)
+    return target_review_min, target_word_count, min_word_count, max_word_count
+
+
+def build_model_candidates(selected_model, available_models):
+    """Prefer capable text/video Flash models and exclude non-text variants."""
+    blocked_markers = ("-tts", "-image", "-live", "transcribe", "embedding", "aqa")
+    usable = []
+    for model in available_models:
+        name = str(model).replace("models/", "")
+        if "gemini" not in name.lower() or any(marker in name.lower() for marker in blocked_markers):
+            continue
+        usable.append(name)
+
+    preferred_names = [
+        "gemini-3.5-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ]
+    selected_model = str(selected_model or "").replace("models/", "")
+    selected = [] if any(marker in selected_model.lower() for marker in blocked_markers) else [selected_model]
+    preferred = [name for name in preferred_names if name in usable]
+    ordered = selected + preferred + [m for m in usable if "flash" in m.lower()] + usable
+    seen = set()
+    return [m for m in ordered if m and m not in seen and not seen.add(m)]
+
+
+def is_usable_story_map(story_map, video_duration_min):
+    """Validate extraction structure without spending another API request."""
+    event_count = len(re.findall(r"\[EVENT=\d+:\d+-\d+:\d+\]", story_map or "", re.IGNORECASE))
+    minimum_events = 1 if float(video_duration_min) <= 5 else 2
+    return event_count >= minimum_events
+
+
 def _bg_cleanup_loop():
     """Tu dong don dep: preview TTS cu + TASKS da hoan thanh."""
     import time
@@ -312,22 +363,22 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             if need_compress:
                 update_prog(12, f"Dang nen video ({orig_size_mb:.0f}MB -> nho hon)... Co the mat vai phut.")
                 
-                # Tinh CRF phu hop theo do dai video de dam bao < 2GB sau nen
-                # Target: ~500MB cho video 1h, ~200MB cho video 30p
+                # Gemini samples video independently. Keep enough source detail
+                # for faces/text while avoiding wasteful upload frame rates.
                 if orig_dur > 1800:  # > 30 phut
-                    crf_val = "32"
-                    audio_br = "48k"
-                    target_fps = "15"
-                    scale_h = 480
-                elif orig_dur > 600:  # > 10 phut
                     crf_val = "30"
-                    audio_br = "56k"
-                    target_fps = "20"
-                    scale_h = 540
+                    audio_br = "64k"
+                    target_fps = "12"
+                    scale_h = 720
+                elif orig_dur > 600:  # > 10 phut
+                    crf_val = "29"
+                    audio_br = "64k"
+                    target_fps = "12"
+                    scale_h = 720
                 else:
                     crf_val = "28"
-                    audio_br = "64k"
-                    target_fps = "24"
+                    audio_br = "96k"
+                    target_fps = "12"
                     scale_h = 720
                 
                 scale_filter = f"scale=-2:{scale_h}" if orig_h > scale_h else ""
@@ -444,22 +495,9 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
         video_duration_sec, _, _ = get_video_info(video_path)
         video_duration_min = max(1, video_duration_sec / 60)
         
-        if review_minutes == "auto":
-            recap_ratio = 0.30 if video_duration_min > 30 else (0.40 if video_duration_min > 10 else 0.50)
-            target_review_min = max(1.5, video_duration_min * recap_ratio)
-        else:
-            target_review_min = min(float(review_minutes), video_duration_min)
-
-        # Vietnamese Edge TTS averages roughly 150 words/minute at normal rates.
-        target_word_count = max(250, int(target_review_min * 150))
-        min_word_count = max(200, int(target_word_count * 0.8))
-        # Video dai can nhieu tu hon de bao phu toan bo cau chuyen
-        max_word_count = int(target_word_count * 1.12)
-        
-        if style == "shorts":
-            target_word_count = max(150, int(target_review_min * 130))
-            min_word_count = max(100, int(target_word_count * 0.7))
-            max_word_count = int(target_word_count * 1.12)
+        target_review_min, target_word_count, min_word_count, max_word_count = calculate_script_budget(
+            video_duration_min, review_minutes, style
+        )
             
         style_choice = str(style).lower()
         if style_choice == "humorous" or "hài hước" in style_choice or "giải trí" in style_choice:
@@ -509,12 +547,34 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             
         custom_section = f"\n=== YÊU CẦU BỔ SUNG ===\n{custom_prompt}\n" if custom_prompt.strip() else ""
         
-        # Tinh ngan sach tu/phut
-        words_per_min = int(target_word_count / video_duration_min)
+        max_story_events = min(100, max(12, int(video_duration_min * 0.65)))
+        story_map_prompt = (
+            "=== NHIỆM VỤ DUY NHẤT: LẬP BẢN ĐỒ CỐT TRUYỆN ===\n"
+            f"Xem toàn bộ video dài {video_duration_min:.0f} phút và ghi lại tối đa "
+            f"{max_story_events} sự kiện quan trọng. CHƯA viết lời review, không dùng văn phong YouTube.\n\n"
+            "Bản đồ này sẽ là nguồn sự thật duy nhất để một lượt AI khác viết kịch bản. "
+            "Vì vậy phải ưu tiên đúng sự kiện, đúng nhân vật và đúng thứ tự hơn lời văn hay.\n\n"
+            "Xuất đúng các mục sau bằng văn bản ngắn gọn:\n"
+            "NHÂN VẬT: tên/cách gọi ổn định, đặc điểm nhận diện và vai trò. Nếu chưa biết tên, "
+            "dùng một cách gọi mô tả cố định; tuyệt đối không tự đặt tên.\n"
+            "SỰ KIỆN: mỗi dòng theo mẫu [EVENT=mm:ss-mm:ss] Nhân vật | hành động nhìn/nghe thấy "
+            "| nguyên nhân trực tiếp | kết quả trực tiếp.\n"
+            "KẾT THÚC: sự kiện kết thúc thật của câu chuyện và timestamp của nó.\n\n"
+            "Quy tắc bắt buộc:\n"
+            "- Theo đúng trình tự thời gian từ đầu đến kết thúc câu chuyện.\n"
+            "- Bao phủ mở đầu, các bước ngoặt, cao trào và kết quả cuối; không dồn hết sự kiện vào đầu video.\n"
+            "- Chỉ ghi điều thực sự có trong hình ảnh hoặc âm thanh. Không suy đoán động cơ, quan hệ hay tên riêng.\n"
+            "- Giữ nhất quán cách gọi nhân vật xuyên suốt.\n"
+            "- Bỏ logo, quảng cáo, intro, credit và màn hình kết thúc.\n"
+            "- Mỗi sự kiện chỉ chứa một hành động chính và timestamp phải đúng cảnh.\n"
+            "- Không Markdown, không nhận xét, không viết kịch bản review.\n"
+        )
         
         prompt = (
             f"=== NHIỆM VỤ ===\n"
             f"Bạn là YouTuber recap chuyên nghiệp. Video gốc {video_duration_min:.0f} phút.\n"
+            f"Dựa hoàn toàn trên NGUỒN SỰ KIỆN được cung cấp. Nếu nguồn là BẢN ĐỒ CỐT TRUYỆN, "
+            f"đó là nguồn sự thật duy nhất: không thêm nhân vật, hành động, nguyên nhân hoặc kết quả ngoài bản đồ.\n"
             f"Viết kịch bản khoảng {min_word_count}-{max_word_count} từ kể trọn phần CÂU CHUYỆN thực tế.\n"
             f"Mục tiêu: Người xem HIỂU TRỌN VẸN câu chuyện mà KHÔNG CẦN xem video gốc.\n"
             f"Viết LÔI CUỐN, HẤP DẪN — không cần kể chi tiết từng cảnh, chỉ cần kể ĐÚNG và HAY.\n\n"
@@ -525,7 +585,7 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"Logo và credit không được nhận bất kỳ ngân sách từ nào.\n\n"
             
             f"=== CÁCH VIẾT ===\n"
-            f"1. XEM toàn bộ video để xác định chính xác lúc CÂU CHUYỆN bắt đầu và kết thúc.\n"
+            f"1. ĐỌC/XEM toàn bộ nguồn sự kiện để xác định chính xác lúc CÂU CHUYỆN bắt đầu và kết thúc.\n"
             f"2. Chọn ra các SỰ KIỆN CHÍNH (bước ngoặt, nguy hiểm, thành tựu, kết quả).\n"
             f"3. Kể lại TUẦN TỰ theo thời gian, BỎ QUA những phần nhàm chán/lặp lại.\n"
             f"4. Tập trung vào DIỄN BIẾN và CẢM XÚC, không liệt kê chi tiết.\n"
@@ -547,7 +607,7 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"- KHÔNG được bịa: KHÔNG thêm đồ vật, hành động không có trong video.\n"
             f"- Nếu không rõ → MIÊU TẢ CHUNG ('một cấu trúc', 'một sinh vật'), KHÔNG đoán bừa.\n"
             f"- SAI: 'Xây một cái nhà' khi thực tế đang đào hầm.\n"
-            f"- ĐÚNG: Chỉ viết những gì bạn NHÌN THẤY RÕ RÀNG tại mốc thời gian đó.\n\n"
+            f"- ĐÚNG: Chỉ viết những gì nguồn sự kiện XÁC NHẬN RÕ RÀNG tại mốc thời gian đó.\n\n"
             
             f"=== NHẬN DẠNG MINECRAFT (THAM KHẢO) ===\n"
             f"Nếu video là Minecraft, hãy gọi đúng tên các entity phổ biến:\n"
@@ -607,69 +667,103 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"Bây giờ hãy viết kịch bản:"
         )
 
-        # GOI GEMINI API - fallback models
+        # GOI GEMINI API - two-pass hybrid: video -> compact story map -> text script.
         import time as _time
         try:
             available_models = [m.name.replace("models/", "") if hasattr(m, 'name') else str(m) for m in client.models.list() if "gemini" in (m.name.replace("models/", "") if hasattr(m, 'name') else str(m)).lower()]
         except Exception:
-            available_models = ["gemini-3-flash-preview", "gemini-2.0-flash-lite", "gemini-3.1-flash-lite"]
-            
-        fallback_models = [model_name] + [m for m in available_models if ("flash" in m or "lite" in m) and "preview" not in m] + available_models
-        seen = set()
-        unique_models = [m for m in fallback_models if m not in seen and not seen.add(m)]
-        
-        response = None
+            available_models = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+
+        unique_models = build_model_candidates(model_name, available_models)
         last_error = None
-        used_model = model_name
-        
-        for mi, try_model in enumerate(unique_models):
-            for attempt in range(3):  # Giam xuong 3 lan de tranh treo UI
-                try:
-                    update_prog(75 + mi * 3, f"Dang tao kich ban voi {try_model}... (lan {attempt+1})")
-                    from google.genai import types as _gen_types
-                    _gen_config = _gen_types.GenerateContentConfig(
-                        max_output_tokens=65536,
-                        temperature=0.4,
-                    )
-                    response = client.models.generate_content(
-                        model=try_model,
-                        contents=[video_file, prompt],
-                        config=_gen_config,
-                    )
-                    if response and response.text:
-                        used_model = try_model
-                        break
-                except Exception as api_err:
-                    last_error = api_err
-                    err_msg = str(api_err)
-                    
-                    if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-                        if "limit" in err_msg and "0" in err_msg:
-                            print(f"[!] Model {try_model} co limit=0 (khong ho tro). Bo qua...")
-                            break # Chuyen sang model khac
-                            
-                        wait_sec = 5 * (attempt + 1)  # Chi doi 5s, 10s, 15s
-                        update_prog(75 + mi * 3, f"Het quota ({try_model}), doi {wait_sec}s...")
-                        _time.sleep(wait_sec)
-                    elif "503" in err_msg or "UNAVAILABLE" in err_msg or "overloaded" in err_msg.lower():
-                        wait_sec = 5 * (attempt + 1)
-                        update_prog(75 + mi * 3, f"Server ban ({try_model}), doi {wait_sec}s...")
-                        _time.sleep(wait_sec)
-                    else:
-                        break  # Loi 404 hoac loi khac, thu model tiep theo luon
-            
-            if response and response.text:
-                break
-        
+
+        def generate_with_models(contents, config, candidates, progress, label):
+            nonlocal last_error
+            for mi, try_model in enumerate(candidates):
+                for attempt in range(3):
+                    try:
+                        update_prog(min(93, progress + mi), f"{label} voi {try_model}... (lan {attempt + 1})")
+                        result = client.models.generate_content(
+                            model=try_model,
+                            contents=contents,
+                            config=config,
+                        )
+                        if result and result.text and result.text.strip():
+                            return result, try_model
+                    except Exception as api_err:
+                        last_error = api_err
+                        err_msg = str(api_err)
+                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+                            if "limit" in err_msg and "0" in err_msg:
+                                print(f"[!] Model {try_model} co limit=0 (khong ho tro). Bo qua...", flush=True)
+                                break
+                            wait_sec = 5 * (attempt + 1)
+                            update_prog(progress, f"Het quota ({try_model}), doi {wait_sec}s...")
+                            _time.sleep(wait_sec)
+                        elif "503" in err_msg or "UNAVAILABLE" in err_msg or "overloaded" in err_msg.lower():
+                            wait_sec = 5 * (attempt + 1)
+                            update_prog(progress, f"Server ban ({try_model}), doi {wait_sec}s...")
+                            _time.sleep(wait_sec)
+                        else:
+                            break
+            return None, None
+
+        from google.genai import types as _gen_types
+        map_config = _gen_types.GenerateContentConfig(
+            max_output_tokens=20000,
+            temperature=0.15,
+        )
+        update_prog(72, "Dang xem toan bo video va lap ban do cot truyen...")
+        map_response, map_model = generate_with_models(
+            [video_file, story_map_prompt], map_config, unique_models, 72, "Dang lap ban do cot truyen"
+        )
+
+        response = None
+        used_model = map_model or model_name
+        if map_response and is_usable_story_map(map_response.text, video_duration_min):
+            story_map = map_response.text.strip()
+            print(f"[+] Ban do cot truyen: {len(story_map.split())} tu, model={map_model}", flush=True)
+            final_prompt = (
+                "=== BẢN ĐỒ CỐT TRUYỆN ĐÃ TRÍCH XUẤT TỪ VIDEO ===\n"
+                f"{story_map}\n\n"
+                "=== YÊU CẦU VIẾT KỊCH BẢN ===\n"
+                f"{prompt}"
+            )
+            script_config = _gen_types.GenerateContentConfig(
+                max_output_tokens=65536,
+                temperature=0.4,
+            )
+            script_models = build_model_candidates(map_model, available_models)
+            update_prog(84, "Da co ban do cot truyen. Dang viet kich ban...")
+            response, used_model = generate_with_models(
+                final_prompt, script_config, script_models, 84, "Dang viet kich ban"
+            )
+        elif map_response and map_response.text:
+            print("[!] Ban do cot truyen sai cau truc; khong dua du lieu hong sang luot viet.", flush=True)
+
+        # Safe fallback: preserve the previous direct-video behavior only when
+        # one of the two hybrid stages failed technically.
+        if not response or not response.text:
+            print("[!] Pipeline hai luot that bai; thu lai co che video -> kich ban truc tiep.", flush=True)
+            update_prog(88, "Dang dung co che truc tiep du phong...")
+            direct_config = _gen_types.GenerateContentConfig(
+                max_output_tokens=65536,
+                temperature=0.4,
+            )
+            response, used_model = generate_with_models(
+                [video_file, prompt], direct_config, unique_models, 88, "Dang tao kich ban du phong"
+            )
+
         if not response or not response.text:
             with open(os.path.join(WORKSPACE_DIR, "debug_api_error.log"), "w", encoding="utf-8") as f:
                 f.write(f"Model: {model_name}\nLast Error:\n{str(last_error)}\n")
             raise Exception(f"Tat ca models that bai. Loi cuoi: {str(last_error)[:200]}")
         script_text = response.text
         word_count_raw = len(script_text.split())
-        print(f"[+] Kich ban lan 1: {word_count_raw} tu", flush=True)
+        print(f"[+] Kich ban hoan chinh: {word_count_raw} tu, model={used_model}", flush=True)
         
-        # === AUTO-CONTINUE: Neu kich ban chua den cuoi video, goi API lan 2 ===
+        # Read the final timestamp for diagnostics. Do not spend another request
+        # merely to force coverage through possible end credits.
         import re as _re_check
         all_ts = _re_check.findall(r'\[TIME=(\d+):(\d+)(?:-(\d+):(\d+))?\]', script_text)
         last_ts_sec = 0
@@ -908,7 +1002,7 @@ def check_key():
         available = []
         for m in models_list:
             name = m.name.replace("models/", "") if hasattr(m, 'name') else str(m)
-            if "gemini" in name.lower():
+            if name in build_model_candidates(name, [name]):
                 available.append(name)
         return jsonify({"valid": True, "message": "Kết nối API Gemini thành công!", "models": available})
     except Exception as e:
@@ -916,7 +1010,7 @@ def check_key():
         if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
             return jsonify({"valid": False, "message": "API Key không hợp lệ! Kiểm tra lại tại https://aistudio.google.com/apikey"})
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-            return jsonify({"valid": True, "message": "API Key hợp lệ! Nhưng đã hết quota miễn phí hôm nay. Quota sẽ reset sau 24h.", "models": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite"]})
+            return jsonify({"valid": True, "message": "API Key hợp lệ! Nhưng đã hết quota miễn phí hôm nay. Quota sẽ reset sau 24h.", "models": ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]})
         return jsonify({"valid": False, "message": f"Lỗi kết nối: {err_msg[:200]}"})
 
 @app.route("/api/list-videos", methods=["GET"])
@@ -937,7 +1031,7 @@ def debug_models():
         for m in client.models.list():
             results.append(m.name if hasattr(m, 'name') else str(m))
         
-        test_models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite"]
+        test_models = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
         working = []
         for tm in test_models:
             try:
@@ -999,7 +1093,7 @@ def upload_file():
 def analyze_video():
     data = request.json or {}
     api_key = data.get("api_key", "").strip() or DEFAULT_API_KEY
-    model_name = data.get("model_name", "gemini-1.5-flash")
+    model_name = data.get("model_name", "gemini-3.5-flash")
     video_filename = data.get("video_name", "")
     style = data.get("style", "dramatic")
     custom_prompt = data.get("custom_prompt", "").strip()

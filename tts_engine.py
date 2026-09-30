@@ -334,7 +334,18 @@ def parse_sentences_and_visual_beats(sentences):
         for marker in markers:
             text = sanitize_script_text(body[cursor:marker.start()])
             if text:
-                parts.append({"text": text, "start": beat_start, "end": beat_end})
+                marker_start = _time_value_to_seconds(marker.group("start"))
+                # Gemini sometimes makes TIME cover the complete narration row
+                # and then places a BEAT inside that range. Treat BEAT as the
+                # internal scene boundary instead of rejecting the whole job.
+                effective_end = beat_end
+                if (
+                    beat_start is not None and beat_end is not None
+                    and marker_start is not None
+                    and beat_start < marker_start < beat_end
+                ):
+                    effective_end = marker_start
+                parts.append({"text": text, "start": beat_start, "end": effective_end})
             beat_start = _time_value_to_seconds(marker.group("start"))
             beat_end = _time_value_to_seconds(marker.group("end"))
             cursor = marker.end()
@@ -349,6 +360,49 @@ def parse_sentences_and_visual_beats(sentences):
         starts.append(start)
         ends.append(end)
         visual_groups.append(parts)
+
+    # Normalize every visual range into a strictly increasing timeline. Gemini
+    # can emit partial overlaps, fully nested ranges, backwards ranges, or an
+    # end equal to the start. Repair all of them here so the render endpoint and
+    # worker use the exact same safe timeline.
+    minimum_duration = 1.0
+    previous_beat = None
+    for row_index, group in enumerate(visual_groups):
+        for beat_index, beat in enumerate(group):
+            current_start = beat.get("start")
+            current_end = beat.get("end")
+
+            if current_start is None and previous_beat is not None:
+                current_start = previous_beat.get("end")
+                beat["start"] = current_start
+            if current_start is not None and (current_end is None or current_end <= current_start):
+                current_end = current_start + minimum_duration
+                beat["end"] = current_end
+
+            if previous_beat is not None and current_start is not None:
+                previous_start = previous_beat.get("start")
+                previous_end = previous_beat.get("end")
+                if previous_end is not None and current_start < previous_end:
+                    # Prefer preserving Gemini's current anchor by trimming the
+                    # prior range when that still leaves a positive duration.
+                    if previous_start is not None and current_start >= previous_start + minimum_duration:
+                        previous_beat["end"] = current_start
+                    else:
+                        # A fully backwards/nested anchor cannot be fixed by
+                        # trimming. Move it directly after the previous range.
+                        current_start = previous_end
+                        beat["start"] = current_start
+                        if current_end is None or current_end <= current_start:
+                            current_end = current_start + minimum_duration
+                            beat["end"] = current_end
+            previous_beat = beat
+
+    # A later row may trim the final beat of an earlier row, so synchronize
+    # row-level ranges only after the complete flattened timeline is repaired.
+    for row_index, group in enumerate(visual_groups):
+        if group:
+            starts[row_index] = group[0].get("start")
+            ends[row_index] = group[-1].get("end")
 
     return clean_sentences, starts, ends, visual_groups
 

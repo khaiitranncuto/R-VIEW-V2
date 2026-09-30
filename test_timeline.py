@@ -135,6 +135,50 @@ class TimelineParsingTests(unittest.TestCase):
         )
         self.assertEqual([(b["start"], b["end"]) for b in groups[0]], [(80, 84), (87, 91)])
 
+    def test_nested_inline_beat_becomes_internal_scene_boundary(self):
+        source = (
+            "[TIME=00:31-01:26] Kukuru lao xuong suoi, "
+            "[BEAT=01:05-01:26] roi bat duoc mot con ca."
+        )
+        rows = split_text_into_sentences(source)
+        _, starts, ends, groups = parse_sentences_and_visual_beats(rows)
+        self.assertEqual(starts, [31])
+        self.assertEqual(ends, [86])
+        self.assertEqual(
+            [(beat["start"], beat["end"]) for beat in groups[0]],
+            [(31, 65), (65, 86)],
+        )
+
+    def test_consecutive_overlapping_rows_are_trimmed_at_next_start(self):
+        source = (
+            "[TIME=85:00-85:53] Nobita giai cuu cac ban.\n"
+            "[TIME=85:17-86:06] Kukuru cung dan lang vung len."
+        )
+        rows = split_text_into_sentences(source)
+        _, starts, ends, groups = parse_sentences_and_visual_beats(rows)
+        self.assertEqual(starts, [5100, 5117])
+        self.assertEqual(ends, [5117, 5166])
+        self.assertEqual(groups[0][0]["end"], 5117)
+
+    def test_fully_backwards_range_is_moved_after_previous_range(self):
+        source = (
+            "[TIME=85:00-85:10] Su kien duoc ke truoc.\n"
+            "[TIME=84:50-85:00] Su kien duoc ke sau nhung Gemini dat moc lui."
+        )
+        rows = split_text_into_sentences(source)
+        _, starts, ends, groups = parse_sentences_and_visual_beats(rows)
+        self.assertEqual(starts, [5100, 5110])
+        self.assertEqual(ends, [5110, 5111])
+        self.assertEqual(groups[1][0]["start"], 5110)
+        self.assertGreater(groups[1][0]["end"], groups[1][0]["start"])
+
+    def test_zero_length_range_is_given_safe_positive_duration(self):
+        rows = split_text_into_sentences("[TIME=70:00-70:00] Mot canh ngan.")
+        _, starts, ends, groups = parse_sentences_and_visual_beats(rows)
+        self.assertEqual(starts, [4200])
+        self.assertEqual(ends, [4201])
+        self.assertEqual(groups[0][0]["end"], 4201)
+
     def test_visual_edl_uses_word_boundaries_inside_one_sentence(self):
         sentences = ["Luke nhat xuong, roi tim thay dau chan gau."]
         groups = [[

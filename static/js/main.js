@@ -320,8 +320,8 @@ async function verifyApiKey(showSuccessToast = true) {
                 const currentVal = modelSelect.value;
                 modelSelect.innerHTML = '';
                 
-                // Uu tien lite models (an toan nhat cho free tier), sau do flash
-                const preferred = ['gemini-3.1-flash-lite', 'gemini-2.0-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3-flash-preview'];
+                // Prefer the full Flash model for long-form story coherence.
+                const preferred = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
                 const sorted = data.models.sort((a, b) => {
                     const aIdx = preferred.indexOf(a);
                     const bIdx = preferred.indexOf(b);
