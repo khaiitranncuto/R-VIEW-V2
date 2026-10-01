@@ -27,6 +27,15 @@ from task_store import (
     save_task_payload,
     save_task_state,
 )
+from shot_storyboard import (
+    build_storyboard_reel,
+    choose_candidate_shots,
+    detect_locked_shots,
+    parse_shot_selection,
+    parse_story_event_ranges,
+    shot_script_to_timeline,
+    validate_timeline_ranges,
+)
 
 # =====================================================================
 # Cấu hình Môi trường
@@ -335,11 +344,35 @@ threading.Thread(target=_bg_cleanup_loop, daemon=True).start()
 # =====================================================================
 # BACKGROUND TASK RUNNERS
 # =====================================================================
-def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom_prompt, enable_multi_voice=False, review_minutes="auto"):
+def analyze_video_bg(
+    task_id, api_key, model_name, video_filename, style, custom_prompt,
+    enable_multi_voice=False, review_minutes="auto", analysis_passes=2,
+):
     def update_prog(prog, msg):
         with task_lock:
             TASKS[task_id]["progress"] = prog
             TASKS[task_id]["message"] = msg
+
+    compressed_path = ""
+    storyboard_dir = ""
+    remote_files = []
+    client = None
+
+    def cleanup_analysis_artifacts():
+        if client is not None:
+            for remote_file in list(remote_files):
+                try:
+                    client.files.delete(name=remote_file.name)
+                except Exception:
+                    pass
+            remote_files.clear()
+        if compressed_path and os.path.isfile(compressed_path):
+            try:
+                os.remove(compressed_path)
+            except OSError:
+                pass
+        if storyboard_dir and os.path.isdir(storyboard_dir):
+            shutil.rmtree(storyboard_dir, ignore_errors=True)
 
     try:
         video_path = os.path.join(WORKSPACE_DIR, video_filename)
@@ -354,7 +387,7 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
         from video_renderer import get_ffmpeg_exe, get_video_info
         ffmpeg_exe = get_ffmpeg_exe()
         
-        compressed_path = video_path.rsplit('.', 1)[0] + "_gemini_temp.mp4"
+        compressed_path = video_path.rsplit('.', 1)[0] + f"_gemini_{task_id}.mp4"
         try:
             orig_dur, orig_w, orig_h = get_video_info(video_path)
             orig_size_mb = os.path.getsize(video_path) / (1024 * 1024)
@@ -430,6 +463,7 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
         for upload_attempt in range(5):
             try:
                 video_file = client_upload.files.upload(file=upload_path)
+                remote_files.append(video_file)
                 break
             except Exception as upload_err:
                 last_upload_error = upload_err
@@ -452,13 +486,6 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             else:
                 raise Exception(f"Upload that bai sau 5 lan. Loi: {err_detail}")
         
-        # Xoa file nen tam
-        if upload_path != video_path and os.path.exists(compressed_path):
-            try:
-                os.remove(compressed_path)
-            except Exception:
-                pass
-
         # Doi file ACTIVE - voi retry cho files.get 404
         update_prog(40, "Dang cho Gemini xu ly video...")
         max_wait = 900  # 15 phut cho video dai
@@ -667,114 +694,227 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
             f"Bây giờ hãy viết kịch bản:"
         )
 
-        # GOI GEMINI API - two-pass hybrid: video -> compact story map -> text script.
-        import time as _time
+        # Two calls by default, three only when explicitly selected:
+        # source video -> story map -> local SHOT_ID reel -> locked narration.
         try:
             available_models = [m.name.replace("models/", "") if hasattr(m, 'name') else str(m) for m in client.models.list() if "gemini" in (m.name.replace("models/", "") if hasattr(m, 'name') else str(m)).lower()]
         except Exception:
             available_models = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
         unique_models = build_model_candidates(model_name, available_models)
-        last_error = None
+        if not unique_models:
+            raise Exception("Khong tim thay model Gemini Flash ho tro video va text.")
+        used_model = unique_models[0]
+        generation_call_count = 0
+        max_generation_calls = 3 if int(analysis_passes) == 3 else 2
 
-        def generate_with_models(contents, config, candidates, progress, label):
-            nonlocal last_error
-            for mi, try_model in enumerate(candidates):
-                for attempt in range(3):
-                    try:
-                        update_prog(min(93, progress + mi), f"{label} voi {try_model}... (lan {attempt + 1})")
-                        result = client.models.generate_content(
-                            model=try_model,
-                            contents=contents,
-                            config=config,
-                        )
-                        if result and result.text and result.text.strip():
-                            return result, try_model
-                    except Exception as api_err:
-                        last_error = api_err
-                        err_msg = str(api_err)
-                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-                            if "limit" in err_msg and "0" in err_msg:
-                                print(f"[!] Model {try_model} co limit=0 (khong ho tro). Bo qua...", flush=True)
-                                break
-                            wait_sec = 5 * (attempt + 1)
-                            update_prog(progress, f"Het quota ({try_model}), doi {wait_sec}s...")
-                            _time.sleep(wait_sec)
-                        elif "503" in err_msg or "UNAVAILABLE" in err_msg or "overloaded" in err_msg.lower():
-                            wait_sec = 5 * (attempt + 1)
-                            update_prog(progress, f"Server ban ({try_model}), doi {wait_sec}s...")
-                            _time.sleep(wait_sec)
-                        else:
-                            break
-            return None, None
+        def generate_once(contents, config, progress, label):
+            nonlocal generation_call_count
+            if generation_call_count >= max_generation_calls:
+                raise RuntimeError(
+                    f"Da cham gioi han {max_generation_calls} luot Gemini cho mot video."
+                )
+            generation_call_count += 1
+            update_prog(
+                progress,
+                f"{label} ({generation_call_count}/{max_generation_calls}) voi {used_model}...",
+            )
+            result = client.models.generate_content(
+                model=used_model,
+                contents=contents,
+                config=config,
+            )
+            if not result or not result.text or not result.text.strip():
+                raise RuntimeError(
+                    f"Gemini khong tra ve du lieu o luot "
+                    f"{generation_call_count}/{max_generation_calls}."
+                )
+            return result
 
         from google.genai import types as _gen_types
         map_config = _gen_types.GenerateContentConfig(
             max_output_tokens=20000,
             temperature=0.15,
         )
-        update_prog(72, "Dang xem toan bo video va lap ban do cot truyen...")
-        map_response, map_model = generate_with_models(
-            [video_file, story_map_prompt], map_config, unique_models, 72, "Dang lap ban do cot truyen"
+        map_response = generate_once(
+            [video_file, story_map_prompt], map_config, 72,
+            "Luot 1: lap ban do cot truyen"
+        )
+        if not is_usable_story_map(map_response.text, video_duration_min):
+            raise ValueError("Luot 1 khong tao duoc ban do cot truyen co EVENT timestamp.")
+        story_map = map_response.text.strip()
+        print(f"[+] Ban do cot truyen: {len(story_map.split())} tu, model={used_model}", flush=True)
+
+        # Build immutable local shot IDs. Gemini sees a short evidence reel, not
+        # the full film, and can only select IDs generated by the backend.
+        storyboard_dir = os.path.join(WORKSPACE_DIR, f"temp_storyboard_{task_id}")
+        os.makedirs(storyboard_dir, exist_ok=True)
+        update_prog(74, "Dang phat hien ranh gioi shot that trong video...")
+        shots = detect_locked_shots(
+            video_path,
+            upload_path,
+            os.path.join(WORKSPACE_DIR, ".scene_cache"),
+        )
+        event_ranges = parse_story_event_ranges(story_map, video_duration_sec)
+        candidate_indices = choose_candidate_shots(
+            shots,
+            event_ranges,
+            video_duration_sec,
+            padding=5.0,
+            max_per_event=12,
+            max_total=900,
+        )
+        storyboard_path, candidate_shots = build_storyboard_reel(
+            upload_path,
+            shots,
+            candidate_indices,
+            storyboard_dir,
+            ffmpeg_exe,
+            update_prog,
+        )
+        print(
+            f"[+] Shot storyboard: {len(shots)} shot nguon, "
+            f"{len(candidate_shots)} shot ung vien.", flush=True
         )
 
-        response = None
-        used_model = map_model or model_name
-        if map_response and is_usable_story_map(map_response.text, video_duration_min):
-            story_map = map_response.text.strip()
-            print(f"[+] Ban do cot truyen: {len(story_map.split())} tu, model={map_model}", flush=True)
+        update_prog(79, "Dang tai storyboard SHOT_ID len Gemini...")
+        storyboard_file = client_upload.files.upload(file=storyboard_path)
+        remote_files.append(storyboard_file)
+        waited_storyboard = 0
+        while waited_storyboard < 600:
+            info = client.files.get(name=storyboard_file.name)
+            state_name = info.state.name if hasattr(info.state, "name") else str(info.state)
+            if state_name == "ACTIVE":
+                break
+            if state_name == "FAILED":
+                raise RuntimeError("Gemini khong the xu ly storyboard SHOT_ID.")
+            time.sleep(3)
+            waited_storyboard += 3
+        else:
+            raise RuntimeError("Storyboard SHOT_ID xu ly qua thoi gian cho.")
+
+        allowed_rows = []
+        for shot in candidate_shots:
+            shot_seconds = max(0.2, float(shot["end"]) - float(shot["start"]))
+            word_limit = max(3, min(12, int(round(shot_seconds * 2.5))))
+            allowed_rows.append(
+                f"{shot['id']} SOURCE={shot['start']:.2f}-{shot['end']:.2f} "
+                f"MAX_WORDS={word_limit}"
+            )
+        minimum_selected = 8 if video_duration_min > 5 else 2
+        desired_shots = min(
+            len(candidate_shots), max(minimum_selected, int(round(target_word_count / 6.0)))
+        )
+        common_shot_rules = (
+            f"Select about {desired_shots} useful SHOT_IDs from the attached storyboard reel.\n"
+            "Every storyboard panel shows BEFORE / MID / AFTER frames from one real source shot.\n"
+            "Hard rules:\n"
+            "- Use only SHOT_IDs printed in the reel and ALLOWED SHOTS list.\n"
+            "- Keep strict source chronology; never repeat or move backward.\n"
+            "- Select a shot only when its three frames visibly support the words assigned to it.\n"
+            "- Use reaction shots when the narration changes to a character reaction.\n"
+            "- Skip logos, credits and unclear panels. Do not guess missing actions.\n"
+            "- Never output TIME, timestamps, ACTION, BEAT, headings or Markdown.\n"
+        )
+        shot_voice_instruction = ""
+        if enable_multi_voice:
+            shot_voice_instruction = (
+                "For multi-voice narration, put [VOICE=vi-VN-NamMinhNeural] or "
+                "[VOICE=vi-VN-HoaiMyNeural] immediately AFTER a SHOT marker, never before it. "
+                "Example: [SHOT=S00001] [VOICE=vi-VN-NamMinhNeural] narration fragment.\n"
+            )
+
+        alignment_config = _gen_types.GenerateContentConfig(
+            max_output_tokens=65536,
+            temperature=0.2 if max_generation_calls == 2 else 0.1,
+        )
+        if max_generation_calls == 2:
+            shot_prompt = (
+                "=== PASS 2/2: SELECT LOCKED SHOTS AND WRITE VIETNAMESE NARRATION ===\n"
+                f"{common_shot_rules}\n"
+                f"Write about {min_word_count}-{max_word_count} Vietnamese words in style: {style}.\n"
+                "Output only narration fragments, each prefixed by its visual shot:\n"
+                "[SHOT=S00001] first natural clause,\n"
+                "[SHOT=S00002] next clause completing the same sentence.\n\n"
+                "A natural sentence may span 1-3 consecutive SHOT markers. Keep commas or connective "
+                "words between fragments so grouped TTS reads continuously. Respect MAX_WORDS for every "
+                "shot. Each fragment must describe the visible action/reaction in that exact shot.\n"
+                f"{pacing_instruction}\n{shot_voice_instruction}\n"
+                f"Additional instruction: {custom_prompt.strip() or 'none'}.\n\n"
+                "=== STORY MAP ===\n"
+                f"{story_map}\n\n=== ALLOWED SHOTS ===\n" + "\n".join(allowed_rows)
+            )
+            response = generate_once(
+                [storyboard_file, shot_prompt], alignment_config, 88,
+                "Luot 2: chon SHOT_ID va viet loi"
+            )
+            script_text = shot_script_to_timeline(
+                response.text, candidate_shots, minimum_shots=minimum_selected
+            )
+        else:
+            selection_prompt = (
+                "=== PASS 2/3: SELECT AND DESCRIBE LOCKED SHOTS ===\n"
+                f"{common_shot_rules}\n"
+                "Output exactly one literal visible description per selected shot:\n"
+                "[SHOT=S00001] short literal action or reaction visible in this shot\n\n"
+                "=== STORY MAP ===\n"
+                f"{story_map}\n\n=== ALLOWED SHOTS ===\n" + "\n".join(allowed_rows)
+            )
+            selection_response = generate_once(
+                [storyboard_file, selection_prompt], alignment_config, 84,
+                "Luot 2: khoa chuoi SHOT_ID"
+            )
+            selected_shots, _ = parse_shot_selection(
+                selection_response.text,
+                candidate_shots,
+                minimum_shots=minimum_selected,
+            )
+            narration_rows = []
+            for shot in selected_shots:
+                seconds = max(0.2, float(shot["end"]) - float(shot["start"]))
+                word_limit = max(3, min(12, int(round(seconds * 2.5))))
+                narration_rows.append(
+                    f"[SHOT={shot['id']} MAX_WORDS={word_limit}] {shot['description']}"
+                )
             final_prompt = (
-                "=== BẢN ĐỒ CỐT TRUYỆN ĐÃ TRÍCH XUẤT TỪ VIDEO ===\n"
-                f"{story_map}\n\n"
-                "=== YÊU CẦU VIẾT KỊCH BẢN ===\n"
-                f"{prompt}"
+                "=== PASS 3/3: WRITE NATURAL VIETNAMESE NARRATION ===\n"
+                f"Write about {min_word_count}-{max_word_count} words in style: {style}.\n"
+                "Use only the locked SHOT_IDs below, exactly once and in the given order. "
+                "A natural sentence may span 1-3 consecutive markers. Output:\n"
+                "[SHOT=S00001] narration fragment, [SHOT=S00002] next fragment.\n"
+                "Respect every MAX_WORDS value. Do not output TIME, timestamps, ACTION, BEAT, "
+                "headings, notes, Markdown or BREAK tags.\n"
+                f"{pacing_instruction}\n{shot_voice_instruction}\n"
+                f"Additional instruction: {custom_prompt.strip() or 'none'}.\n\n"
+                "=== LOCKED SHOTS ===\n" + "\n".join(narration_rows)
             )
-            script_config = _gen_types.GenerateContentConfig(
+            final_config = _gen_types.GenerateContentConfig(
                 max_output_tokens=65536,
-                temperature=0.4,
+                temperature=0.35,
             )
-            script_models = build_model_candidates(map_model, available_models)
-            update_prog(84, "Da co ban do cot truyen. Dang viet kich ban...")
-            response, used_model = generate_with_models(
-                final_prompt, script_config, script_models, 84, "Dang viet kich ban"
+            response = generate_once(
+                final_prompt, final_config, 91,
+                "Luot 3: viet loi theo SHOT_ID da khoa"
             )
-        elif map_response and map_response.text:
-            print("[!] Ban do cot truyen sai cau truc; khong dua du lieu hong sang luot viet.", flush=True)
-
-        # Safe fallback: preserve the previous direct-video behavior only when
-        # one of the two hybrid stages failed technically.
-        if not response or not response.text:
-            print("[!] Pipeline hai luot that bai; thu lai co che video -> kich ban truc tiep.", flush=True)
-            update_prog(88, "Dang dung co che truc tiep du phong...")
-            direct_config = _gen_types.GenerateContentConfig(
-                max_output_tokens=65536,
-                temperature=0.4,
-            )
-            response, used_model = generate_with_models(
-                [video_file, prompt], direct_config, unique_models, 88, "Dang tao kich ban du phong"
+            script_text = shot_script_to_timeline(
+                response.text, selected_shots, minimum_shots=minimum_selected
             )
 
-        if not response or not response.text:
-            with open(os.path.join(WORKSPACE_DIR, "debug_api_error.log"), "w", encoding="utf-8") as f:
-                f.write(f"Model: {model_name}\nLast Error:\n{str(last_error)}\n")
-            raise Exception(f"Tat ca models that bai. Loi cuoi: {str(last_error)[:200]}")
-        script_text = response.text
+        validate_timeline_ranges(script_text, video_duration_sec)
         word_count_raw = len(script_text.split())
-        print(f"[+] Kich ban hoan chinh: {word_count_raw} tu, model={used_model}", flush=True)
+        print(
+            f"[+] Kich ban SHOT_ID: {word_count_raw} tu, "
+            f"{generation_call_count}/{max_generation_calls} luot, "
+            f"model={used_model}", flush=True
+        )
         
         # Read the final timestamp for diagnostics. Do not spend another request
         # merely to force coverage through possible end credits.
-        import re as _re_check
-        all_ts = _re_check.findall(r'\[TIME=(\d+):(\d+)(?:-(\d+):(\d+))?\]', script_text)
-        last_ts_sec = 0
-        if all_ts:
-            start_mm, start_ss, end_mm, end_ss = all_ts[-1]
-            last_ts_sec = (
-                int(end_mm) * 60 + int(end_ss)
-                if end_mm and end_ss else int(start_mm) * 60 + int(start_ss)
-            )
+        parsed_ranges = [extract_time_range(row)[:2] for row in script_text.splitlines()]
+        parsed_ranges = [item for item in parsed_ranges if item[0] is not None]
+        last_ts_sec = (parsed_ranges[-1][1] or parsed_ranges[-1][0]) if parsed_ranges else 0
         
-        print(f"[+] Timestamps tim thay: {len(all_ts)}, cuoi cung: {last_ts_sec}s/{video_duration_sec:.0f}s ({last_ts_sec/video_duration_sec*100:.0f}%)", flush=True)
+        print(f"[+] Timestamps tim thay: {len(parsed_ranges)}, cuoi cung: {last_ts_sec:.2f}s/{video_duration_sec:.0f}s ({last_ts_sec/video_duration_sec*100:.0f}%)", flush=True)
         
         # Do not auto-continue based on percentage of the source file. The tail
         # can be end credits; Gemini must stop at the actual story conclusion.
@@ -812,22 +952,23 @@ def analyze_video_bg(task_id, api_key, model_name, video_filename, style, custom
         # block per row. This also repairs Gemini responses returned as one blob.
         script_text = remove_non_story_timeline_rows(script_text)
 
-        # Don dep file tren Gemini
+        # Don dep file tam va cac upload Gemini cua phien nay.
         update_prog(95, "Dang don dep...")
-        try:
-            client.files.delete(name=video_file.name)
-        except Exception:
-            pass
+        cleanup_analysis_artifacts()
 
         with task_lock:
             TASKS[task_id]["status"] = "success"
             TASKS[task_id]["progress"] = 100
             TASKS[task_id]["message"] = "Tao kich ban thanh cong!"
             TASKS[task_id]["result"] = script_text
+            TASKS[task_id]["analysis_method"] = "locked-shot-id-storyboard"
+            TASKS[task_id]["generation_calls"] = generation_call_count
+            TASKS[task_id]["candidate_shots"] = len(candidate_shots)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        cleanup_analysis_artifacts()
         err_msg = str(e)
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
             user_msg = "Đã hết quota API miễn phí hôm nay! Quota sẽ tự động reset sau 24h. Vui lòng thử lại sau."
@@ -1093,7 +1234,7 @@ def upload_file():
 def analyze_video():
     data = request.json or {}
     api_key = data.get("api_key", "").strip() or DEFAULT_API_KEY
-    model_name = data.get("model_name", "gemini-3.5-flash")
+    model_name = data.get("model_name", "gemini-3.1-flash-lite")
     video_filename = data.get("video_name", "")
     style = data.get("style", "dramatic")
     custom_prompt = data.get("custom_prompt", "").strip()
@@ -1101,6 +1242,10 @@ def analyze_video():
     project_id = str(data.get("project_id", "")).strip() or str(uuid.uuid4())
     review_minutes_raw = data.get("review_minutes", "auto")
     review_minutes = "auto" if str(review_minutes_raw).lower() == "auto" else max(3, min(20, int(review_minutes_raw)))
+    try:
+        analysis_passes = 3 if int(data.get("analysis_passes", 2) or 2) == 3 else 2
+    except (TypeError, ValueError):
+        analysis_passes = 2
     
     if not video_filename:
         return jsonify({"success": False, "message": "Chưa chọn video gốc."})
@@ -1116,7 +1261,10 @@ def analyze_video():
     # Khởi chạy tiểu trình phân tích nền
     thread = threading.Thread(
         target=analyze_video_bg,
-        args=(task_id, api_key, model_name, video_filename, style, custom_prompt, enable_multi_voice, review_minutes)
+        args=(
+            task_id, api_key, model_name, video_filename, style, custom_prompt,
+            enable_multi_voice, review_minutes, analysis_passes,
+        )
     )
     thread.daemon = True
     thread.start()
@@ -1172,6 +1320,10 @@ def render_video():
     voice_name = data.get("voice_name", "vi-VN-HoaiMyNeural")
     voice_rate = data.get("voice_rate", "-10%")
     sentences = data.get("sentences", [])
+    raw_timeline_text = (
+        "\n".join(str(item) for item in sentences)
+        if isinstance(sentences, list) else str(sentences or "")
+    )
     # Repair stale/browser timelines before persisting a render payload. Older
     # parsers collapsed timestamps beyond 99:59 into one oversized TTS item.
     if isinstance(sentences, list) and sentences:
@@ -1214,6 +1366,18 @@ def render_video():
         return jsonify({"success": False, "message": "Chưa chọn video gốc."})
     if not sentences:
         return jsonify({"success": False, "message": "Kịch bản trống."})
+
+    # Validate raw editor ranges before older parsing code can clamp, split or
+    # interpolate a malformed timestamp into a plausible-looking wrong scene.
+    try:
+        from video_renderer import get_video_info
+        source_duration, _, _ = get_video_info(os.path.join(WORKSPACE_DIR, video_name))
+        validate_timeline_ranges(raw_timeline_text, source_duration)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return jsonify({
+            "success": False,
+            "message": f"Timeline khóa không hợp lệ: {exc}"
+        }), 400
 
     clean_timeline, range_starts, range_ends, visual_groups = parse_sentences_and_visual_beats(sentences)
     previous_end = -1.0

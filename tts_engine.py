@@ -11,7 +11,7 @@ from datetime import timedelta
 
 # Accept both mm:ss (including videos longer than 99 minutes) and hh:mm:ss.
 # Ordering the 3-part alternative first prevents a partial match on 01:39:47.
-_TIME_VALUE_PATTERN = r'(?:\d+:\d{1,2}:\d{2}|\d+:\d{2})'
+_TIME_VALUE_PATTERN = r'(?:\d+:\d{1,2}:\d{2}(?:\.\d{1,3})?|\d+:\d{2}(?:\.\d{1,3})?)'
 TIMESTAMP_TOKEN_RE = re.compile(
     rf'\[(?:TIME=)?(?P<start>{_TIME_VALUE_PATTERN})'
     rf'(?:\s*-\s*(?P<end>{_TIME_VALUE_PATTERN}))?\]',
@@ -103,10 +103,15 @@ def split_visual_beats(sentence, max_beats=2):
 
 
 def _format_time_value(seconds):
-    seconds = max(0, int(round(float(seconds))))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+    total = max(0.0, float(seconds))
+    hours = int(total // 3600)
+    remainder = total - hours * 3600
+    minutes = int(remainder // 60)
+    secs = remainder - minutes * 60
+    return (
+        f"{hours:02d}:{minutes:02d}:{secs:05.2f}"
+        if hours else f"{minutes:02d}:{secs:05.2f}"
+    )
 
 
 def _allocate_visual_beat_ranges(beats, start, end):
@@ -201,19 +206,10 @@ def split_text_into_sentences(text):
                 sentences.append(f"{timestamp} {part}".strip())
                 continue
             if has_explicit_end:
-                # [BEAT=...] keeps several visual actions inside one natural
-                # narration take. Do not split this row into separate TTS items.
-                if VISUAL_BEAT_TOKEN_RE.search(part):
-                    sentences.append(f"{timestamp} {part}".strip())
-                    continue
-                # One Gemini row may describe two consecutive actions. Give
-                # each action its own chronological visual range, but cap the
-                # cut count so the result does not become frantic.
-                beats = split_visual_beats(part, max_beats=2)
-                start, end, _ = extract_time_range(timestamp)
-                for beat_start, beat_end, beat in _allocate_visual_beat_ranges(beats, start, end):
-                    beat_time = f"[TIME={_format_time_value(beat_start)}-{_format_time_value(beat_end)}]"
-                    sentences.append(f"{beat_time} {beat}".strip())
+                # Explicit ranges are locked shot decisions. Never guess an
+                # internal visual boundary from verbs or commas; only an
+                # explicit BEAT/SHOT decision may change the source image.
+                sentences.append(f"{timestamp} {part}".strip())
                 continue
             for raw_sentence in sentence_end.split(part):
                 for action in _split_action_clauses(raw_sentence):
@@ -263,10 +259,10 @@ def extract_timestamp(text):
 def _time_value_to_seconds(value):
     if not value:
         return None
-    parts = [int(part) for part in value.split(':')]
+    parts = value.split(':')
     if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return int(parts[0]) * 60 + float(parts[1])
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
 
 
 def extract_time_range(text):

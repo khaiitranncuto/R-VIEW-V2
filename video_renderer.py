@@ -90,10 +90,9 @@ def build_visual_edit_plan(
     """Build an audio-led edit decision list for explicit Gemini ranges.
 
     Every narration item owns an independent source anchor. A long previous
-    sentence must never push the next item past its declared action. When a
-    visual range is slightly shorter than its narration, use at most a subtle
-    slowdown and then continue into neighbouring footage instead of cloning a
-    still frame.
+    sentence must never push the next item past its declared action. Explicit
+    ranges are hard visual locks: timing may slow the selected range, but may
+    never borrow frames from a neighbouring action.
     """
     plan = []
     video_duration = max(0.0, float(video_duration))
@@ -112,9 +111,10 @@ def build_visual_edit_plan(
             range_end = min(max(float(raw_end), range_start), video_duration)
             range_duration = range_end - range_start
             if output_duration > range_duration:
-                # Keep the complete declared action and add only the minimum
-                # neighbouring footage needed to avoid an obvious slow motion.
-                source_duration = min(output_duration, max(range_duration, output_duration * min_playback_speed))
+                # A locked ACTION range is authoritative. Never borrow frames
+                # from a neighbouring event merely to avoid slow motion; doing
+                # so was the main cause of cumulative semantic drift.
+                source_duration = range_duration
             else:
                 source_duration = output_duration
             source_start = range_start

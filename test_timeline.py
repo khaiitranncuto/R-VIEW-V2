@@ -90,6 +90,15 @@ class TimelineParsingTests(unittest.TestCase):
         self.assertEqual(starts, [5995, 6005])
         self.assertEqual(ends, [6005, 6015])
 
+    def test_fractional_shot_timestamps_are_preserved(self):
+        rows = split_text_into_sentences(
+            "[TIME=00:03.50-00:04.50] Mot shot ngan chinh xac."
+        )
+        clean, starts, ends = parse_sentences_and_time_ranges(rows)
+        self.assertEqual(clean, ["Mot shot ngan chinh xac."])
+        self.assertEqual(starts, [3.5])
+        self.assertEqual(ends, [4.5])
+
     def test_oversized_tts_is_split_at_safe_boundaries(self):
         text = ("Mot cau ke tu nhien, " * 100).strip()
         pieces = _split_long_tts_text(text, max_chars=200)
@@ -97,29 +106,31 @@ class TimelineParsingTests(unittest.TestCase):
         self.assertTrue(all(0 < len(piece) <= 200 for piece in pieces))
         self.assertEqual(" ".join(pieces), text)
 
-    def test_action_group_becomes_two_ordered_visual_beats(self):
+    def test_explicit_range_is_not_split_from_action_words(self):
         source = (
             "[TIME=02:03-02:14] Con rắn xuất hiện. "
             "Nó lao tới và cuốn lấy cả hai người."
         )
         sentences = split_text_into_sentences(source)
-        self.assertEqual(len(sentences), 2)
+        self.assertEqual(len(sentences), 1)
         clean, starts, ends = parse_sentences_and_time_ranges(sentences)
-        self.assertEqual(clean, ["Con rắn xuất hiện.", "Nó lao tới và cuốn lấy cả hai người."])
-        self.assertEqual(starts, [123, 126])
-        self.assertEqual(ends, [126, 134])
+        self.assertEqual(
+            clean,
+            ["Con rắn xuất hiện. Nó lao tới và cuốn lấy cả hai người."],
+        )
+        self.assertEqual(starts, [123])
+        self.assertEqual(ends, [134])
 
-    def test_visual_beats_are_capped_at_two(self):
+    def test_locked_range_keeps_complete_natural_sentence(self):
         source = (
             "[TIME=00:10-00:19] Anh mở cửa. "
             "Sau đó anh chạy ra ngoài. Cuối cùng anh nhảy xuống nước."
         )
         sentences = split_text_into_sentences(source)
         _, starts, ends = parse_sentences_and_time_ranges(sentences)
-        self.assertEqual(len(sentences), 2)
-        self.assertEqual(starts[0], 10)
-        self.assertEqual(ends[-1], 19)
-        self.assertEqual(ends[0], starts[1])
+        self.assertEqual(len(sentences), 1)
+        self.assertEqual(starts, [10])
+        self.assertEqual(ends, [19])
 
     def test_inline_visual_beats_keep_one_natural_tts_sentence(self):
         source = (
@@ -262,6 +273,17 @@ class TimelineParsingTests(unittest.TestCase):
         )
         self.assertAlmostEqual(plan[0]["source_start"] + plan[0]["source_duration"], 100.0)
         self.assertGreater(plan[0]["source_duration"], 0.0)
+
+    def test_locked_range_never_borrows_frames_from_neighbouring_action(self):
+        plan = build_visual_edit_plan(
+            durations=[10.0],
+            starts=[20.0],
+            ends=[24.0],
+            video_duration=100.0,
+        )
+        self.assertEqual(plan[0]["source_start"], 20.0)
+        self.assertEqual(plan[0]["source_duration"], 4.0)
+        self.assertAlmostEqual(plan[0]["playback_speed"], 0.4)
 
     def test_audio_led_edl_uses_interpolation_for_missing_anchor(self):
         plan = build_visual_edit_plan(

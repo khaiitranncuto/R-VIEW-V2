@@ -6,7 +6,7 @@ const state = {
     selectedVideo: '',
     selectedBgm: '',
     bgmVolume: 12,
-    modelName: 'gemini-3.5-flash',
+    modelName: 'gemini-3.1-flash-lite',
     script: '',
     sentences: [],
     voiceName: 'vi-VN-HoaiMyNeural',
@@ -620,6 +620,7 @@ async function generateScript() {
                 project_id: requestedProjectId,
                 style: style,
                 custom_prompt: customPromptText,
+                analysis_passes: Number(document.getElementById('analysis-passes')?.value || 2),
                 enable_multi_voice: document.getElementById('enable-multi-voice') ? document.getElementById('enable-multi-voice').checked : false
             })
         });
