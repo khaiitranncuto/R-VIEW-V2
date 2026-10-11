@@ -90,13 +90,34 @@
                                 <p class="card-subtitle">Kết nối với Google AI để phân tích video</p>
                             </div>
                         </div>
-                        <div class="form-group">
-                            <label for="api-key-input">Gemini API Key</label>
-                            <div class="input-with-icon">
+                        <div class="form-group api-keys-group" id="api-keys-group">
+                            <div class="api-keys-heading">
+                                <label for="api-key-input">Gemini API Key</label>
+                                <span class="api-priority-hint">Tự chuyển theo thứ tự 1 → 2 → 3</span>
+                            </div>
+                            <div class="input-with-icon api-key-primary-row">
                                 <i class="fa-solid fa-lock"></i>
-                                <input type="password" id="api-key-input" value="{{ default_key }}" placeholder="Nhập Gemini API Key của bạn...">
+                                <span class="api-slot-number">1</span>
+                                <input type="password" id="api-key-input" class="api-key-slot-input" value="{{ default_key }}" placeholder="API 1 — ưu tiên cao nhất">
+                                <button type="button" class="btn-api-priority is-active" data-api-slot="0" title="Đặt API này làm ưu tiên số 1">Ưu tiên</button>
+                                <button type="button" class="btn-expand-api-keys" id="btn-expand-api-keys" title="Thêm API dự phòng" aria-expanded="false" aria-controls="additional-api-keys"><i class="fa-solid fa-chevron-down"></i></button>
                                 <button type="button" class="btn-toggle-pass" id="btn-toggle-api-key"><i class="fa-solid fa-eye"></i></button>
                             </div>
+                            <div class="additional-api-keys hidden" id="additional-api-keys">
+                                <div class="input-with-icon api-key-backup-row">
+                                    <i class="fa-solid fa-lock"></i>
+                                    <span class="api-slot-number">2</span>
+                                    <input type="password" id="api-key-input-2" class="api-key-slot-input" placeholder="API 2 — dự phòng thứ nhất">
+                                    <button type="button" class="btn-api-priority" data-api-slot="1" title="Đặt API này làm ưu tiên số 1">Ưu tiên</button>
+                                </div>
+                                <div class="input-with-icon api-key-backup-row">
+                                    <i class="fa-solid fa-lock"></i>
+                                    <span class="api-slot-number">3</span>
+                                    <input type="password" id="api-key-input-3" class="api-key-slot-input" placeholder="API 3 — dự phòng thứ hai">
+                                    <button type="button" class="btn-api-priority" data-api-slot="2" title="Đặt API này làm ưu tiên số 1">Ưu tiên</button>
+                                </div>
+                            </div>
+                            <div class="api-keys-inline-error hidden" id="api-keys-inline-error" role="alert"></div>
                         </div>
                         <div class="form-group">
                             <label for="model-select">Chọn Mô Hình AI</label>
@@ -175,7 +196,7 @@
                 </div>
 
                 <div class="panel-actions">
-                    <button type="button" class="btn btn-primary" id="btn-to-step2" disabled>Tiếp tục: Tạo Kịch Bản <i class="fa-solid fa-arrow-right"></i></button>
+                    <button type="button" class="btn btn-primary" id="btn-to-step2">Tiếp tục: Tạo Kịch Bản <i class="fa-solid fa-arrow-right"></i></button>
                 </div>
             </section>
 
@@ -207,11 +228,8 @@
                                 </div>
                             </div>
                             <div class="form-group mt-2">
-                                <label for="analysis-passes">Số lượt Gemini</label>
-                                <select id="analysis-passes">
-                                    <option value="2" selected>2 lượt — Tiết kiệm quota</option>
-                                    <option value="3">3 lượt — Viết lời kỹ hơn</option>
-                                </select>
+                                <label>Kiểm tra lời với cảnh</label>
+                                <div class="form-hint">Lượt 1 xem toàn bộ video, chia 3 phần và viết TTS theo scene ID. Lượt 2 chỉ sửa các cảnh bị lỗi, retry tối đa 1 lần.</div>
                             </div>
 
                             <!-- Multi-voice option -->

@@ -547,6 +547,150 @@ select option:checked {
     color: white;
 }
 
+.api-keys-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.api-priority-hint {
+    color: rgba(255, 255, 255, 0.38);
+    font-size: 0.72rem;
+    white-space: nowrap;
+}
+
+.api-key-slot-input {
+    padding-left: 4.25rem !important;
+}
+
+.api-key-primary-row .api-key-slot-input {
+    padding-right: 5.25rem;
+}
+
+.api-key-backup-row .api-key-slot-input {
+    padding-right: 4.9rem;
+}
+
+.api-keys-group.api-keys-expanded .api-key-primary-row .api-key-slot-input {
+    padding-right: 9rem;
+}
+
+.api-slot-number {
+    position: absolute;
+    left: 38px;
+    z-index: 1;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 5px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(139, 92, 246, 0.18);
+    border: 1px solid rgba(167, 139, 250, 0.32);
+    color: #c4b5fd;
+    font-size: 0.7rem;
+    font-weight: 800;
+    pointer-events: none;
+}
+
+.btn-expand-api-keys {
+    position: absolute;
+    right: 43px;
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: rgba(255, 255, 255, 0.48);
+    cursor: pointer;
+    transition: color 0.2s ease, transform 0.2s ease;
+}
+
+.btn-expand-api-keys:hover {
+    color: white;
+}
+
+.btn-expand-api-keys.expanded {
+    transform: rotate(180deg);
+}
+
+.btn-toggle-pass i,
+.btn-expand-api-keys i {
+    position: static;
+    left: auto;
+    pointer-events: none;
+}
+
+.btn-api-priority {
+    position: absolute;
+    z-index: 2;
+    border: 0;
+    cursor: pointer;
+    transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.btn-api-priority {
+    right: 9px;
+    height: 26px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: rgba(139, 92, 246, 0.1);
+    border: 1px solid rgba(167, 139, 250, 0.22);
+    color: rgba(216, 180, 254, 0.78);
+    font-size: 0.67rem;
+    font-weight: 700;
+}
+
+.btn-api-priority:hover,
+.btn-api-priority.is-active {
+    color: #f5f3ff;
+    background: rgba(139, 92, 246, 0.28);
+    border-color: rgba(196, 181, 253, 0.55);
+}
+
+.api-key-primary-row .btn-api-priority {
+    right: 72px;
+}
+
+.api-key-primary-row .btn-api-priority {
+    display: none;
+}
+
+.api-keys-group.api-keys-expanded .api-key-primary-row .btn-api-priority {
+    display: block;
+}
+
+.api-key-slot-input.api-key-duplicate {
+    border-color: #ef4444 !important;
+    background: rgba(239, 68, 68, 0.08) !important;
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.2), 0 0 12px rgba(239, 68, 68, 0.12);
+}
+
+.api-keys-inline-error {
+    margin-top: 0.55rem;
+    color: #f87171;
+    font-size: 0.76rem;
+    font-weight: 600;
+}
+
+.api-keys-inline-error.hidden {
+    display: none;
+}
+
+.additional-api-keys {
+    display: grid;
+    gap: 0.65rem;
+    margin-top: 0.65rem;
+}
+
+.additional-api-keys.hidden {
+    display: none;
+}
+
 .divider {
     display: flex;
     align-items: center;

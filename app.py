@@ -10,14 +10,17 @@ import re
 import traceback
 import faulthandler
 import sys
+import math
+import tempfile
+import unicodedata
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from google import genai
 import asyncio
 import edge_tts
 from tts_engine import (
     extract_time_range,
+    format_timeline_rows,
     parse_sentences_and_visual_beats,
-    parse_sentences_and_time_ranges,
     remove_non_story_timeline_rows,
     split_text_into_sentences,
 )
@@ -27,14 +30,29 @@ from task_store import (
     save_task_payload,
     save_task_state,
 )
-from shot_storyboard import (
-    build_storyboard_reel,
-    choose_candidate_shots,
-    detect_locked_shots,
-    parse_shot_selection,
-    parse_story_event_ranges,
-    shot_script_to_timeline,
+from event_storyboard import (
+    build_timeline_verification_reel,
+    clamp_final_timeline_end,
+    repair_nonpositive_timeline_ranges,
     validate_timeline_ranges,
+)
+from recap_pipeline import (
+    apply_selective_repairs,
+    build_single_part_continuation_prompt,
+    build_single_part_video_prompt,
+    build_selective_repair_prompt,
+    build_three_part_video_prompt,
+    clamp_payload_narrations,
+    inspect_three_part_payload,
+    issue_scene_ids,
+    merge_single_part_additions,
+    merge_single_part_responses,
+    normalize_three_part_payload,
+    payload_to_timeline,
+    scenes_by_ids,
+    single_part_missing_requirements,
+    three_part_targets,
+    validate_single_part_response,
 )
 
 # =====================================================================
@@ -71,6 +89,7 @@ def _save_settings(settings):
         settings_file.flush()
         os.fsync(settings_file.fileno())
     os.replace(temp_path, SETTINGS_PATH)
+
 
 def get_configured_export_directory():
     export_dir = _load_settings().get("export_directory", "")
@@ -130,9 +149,19 @@ def copy_result_to_export_directory(result_url):
 
 app = Flask(__name__, static_folder=os.path.join(WORKSPACE_DIR, "static"), template_folder=os.path.join(WORKSPACE_DIR, "templates"))
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 * 1024  # 10GB cho video dai
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+
+@app.after_request
+def disable_local_ui_cache(response):
+    """The local tool must not keep an old HTML/JS build after code updates."""
+    if request.path == "/" or request.path.endswith((".js", ".css")):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 # Khóa bảo mật mặc định
 DEFAULT_API_KEY = ""
+MAX_CONTINUATION_ROUNDS = 2
 
 # =====================================================================
 # Quản lý Tiến Trình Chạy Ngầm (Thread-safe)
@@ -227,90 +256,431 @@ def append_task_log(task_id, level, message, details=""):
     if details:
         print(details, flush=True)
 
-def _hard_limit_timestamp_script(script_text, max_words):
-    """Last-resort duration guard which preserves coverage through the ending."""
-    words = script_text.split()
-    if len(words) <= max_words:
-        return script_text
-    blocks = [part.strip() for part in re.split(r'(?=\[TIME=[^\]]+\])', script_text) if part.strip()]
-    if len(blocks) < 2:
-        head_count = int(max_words * 0.7)
-        return " ".join(words[:head_count] + words[-(max_words - head_count):])
-
-    block_words = [block.split() for block in blocks]
-    total = sum(len(items) for items in block_words)
-    budgets = [max(6, int(max_words * len(items) / max(total, 1))) for items in block_words]
-    while sum(budgets) > max_words:
-        largest = max(range(len(budgets)), key=lambda i: budgets[i])
-        if budgets[largest] <= 6:
-            break
-        budgets[largest] -= 1
-    while sum(budgets) < max_words:
-        largest = max(range(len(budgets)), key=lambda i: len(block_words[i]) - budgets[i])
-        budgets[largest] += 1
-
-    compacted = []
-    for index, (items, budget) in enumerate(zip(block_words, budgets)):
-        if len(items) <= budget:
-            compacted.extend(items)
-        elif index == len(block_words) - 1:
-            # Keep the timestamp plus the actual conclusion at the end.
-            compacted.append(items[0])
-            compacted.extend(items[-max(0, budget - 1):])
-        else:
-            compacted.extend(items[:budget])
-    return " ".join(compacted[:max_words])
-
-
 def calculate_script_budget(video_duration_min, review_minutes="auto", style="dramatic"):
     """Return one predictable recap budget for every source duration."""
     video_duration_min = max(1.0, float(video_duration_min))
     if review_minutes == "auto":
-        # One rule for every video: recap 20% of the source, capped at 20 minutes.
-        target_review_min = min(20.0, max(1.5, video_duration_min * 0.20))
+        # One rule for every video: target a recap around 25% of the source,
+        # capped at 20 minutes. This is guidance, not a destructive hard stop.
+        target_review_min = min(20.0, max(1.5, video_duration_min * 0.25))
     else:
         target_review_min = min(float(review_minutes), video_duration_min)
 
     words_per_minute = 130 if str(style).lower() == "shorts" else 150
     minimum_words = 150 if words_per_minute == 130 else 250
     target_word_count = max(minimum_words, int(target_review_min * words_per_minute))
-    min_word_count = max(100 if words_per_minute == 130 else 200, int(target_word_count * 0.8))
-    max_word_count = int(target_word_count * 1.12)
+    min_word_count = max(100 if words_per_minute == 130 else 200, math.ceil(target_word_count * 0.85))
+    max_word_count = int(target_word_count * 1.20)
     return target_review_min, target_word_count, min_word_count, max_word_count
 
 
+def _format_review_time(seconds):
+    value = max(0.0, float(seconds))
+    hours = int(value // 3600)
+    minutes = int((value % 3600) // 60)
+    secs = value % 60
+    seconds_text = f"{secs:05.2f}".rstrip("0").rstrip(".")
+    if len(seconds_text.split(".", 1)[0]) < 2:
+        seconds_text = "0" + seconds_text
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds_text}"
+    return f"{minutes:02d}:{seconds_text}"
+
+
+def measure_script_narration(script_text):
+    """Count spoken words and valid timeline rows, excluding TIME metadata."""
+    word_count = 0
+    event_count = 0
+    for row in format_timeline_rows(script_text).splitlines():
+        row = row.strip()
+        if not row:
+            continue
+        start, end, narration = extract_time_range(row)
+        if start is None or end is None:
+            continue
+        event_count += 1
+        narration = re.sub(r"\[VOICE=[^\]]+\]", " ", narration, flags=re.IGNORECASE)
+        word_count += len(re.findall(r"\b\w+\b", narration, flags=re.UNICODE))
+    return word_count, event_count
+
+
+def trim_timeline_ends_to_locked_starts(script_text):
+    """Resolve ordinary overlaps by trimming END only; never move a START."""
+    rows = [
+        row.strip() for row in format_timeline_rows(script_text).splitlines()
+        if row.strip()
+    ]
+    parsed = []
+    for row in rows:
+        start, end, narration = extract_time_range(row)
+        if start is None or end is None:
+            parsed.append([start, end, narration, row])
+        else:
+            parsed.append([float(start), float(end), narration, row])
+
+    for index in range(1, len(parsed)):
+        previous = parsed[index - 1]
+        current = parsed[index]
+        if previous[0] is None or current[0] is None:
+            continue
+        if current[0] <= previous[0]:
+            # Repeated/backwards START values are evidence errors. Preserve
+            # them so validation reports the bad Gemini anchor explicitly.
+            continue
+        if previous[1] is not None and previous[1] > current[0]:
+            previous[1] = current[0]
+
+    normalized = []
+    for start, end, narration, original in parsed:
+        if start is None or end is None:
+            normalized.append(original)
+            continue
+        normalized.append(
+            f"[TIME={_format_review_time(start)}-{_format_review_time(end)}] {narration}"
+        )
+    return "\n".join(normalized)
+
+
+def analysis_proxy_fps(video_duration_sec):
+    """Keep enough temporal detail for Gemini without making long uploads excessive."""
+    duration_min = max(0.0, float(video_duration_sec)) / 60.0
+    if duration_min <= 10:
+        return 12
+    if duration_min <= 30:
+        return 8
+    if duration_min <= 60:
+        return 6
+    return 3
+
+
 def build_model_candidates(selected_model, available_models):
-    """Prefer capable text/video Flash models and exclude non-text variants."""
-    blocked_markers = ("-tts", "-image", "-live", "transcribe", "embedding", "aqa")
+    """Use the selected compatible model first, then known Flash fallbacks."""
+    blocked_markers = (
+        "-tts", "-image", "-live", "transcribe", "embedding", "aqa",
+        "robotics", "bidi", "computer-use", "deep-research", "native-audio",
+    )
     usable = []
     for model in available_models:
-        name = str(model).replace("models/", "")
+        raw_name = getattr(model, "name", model)
+        name = str(raw_name).replace("models/", "")
         if "gemini" not in name.lower() or any(marker in name.lower() for marker in blocked_markers):
             continue
+        supported_actions = getattr(model, "supported_actions", None)
+        if supported_actions:
+            action_names = [
+                str(getattr(action, "value", action)).lower().replace("_", "")
+                for action in supported_actions
+            ]
+            if not any(
+                "generatecontent" in action and "bidi" not in action
+                for action in action_names
+            ):
+                continue
         usable.append(name)
 
     preferred_names = [
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-3.5-flash",
         "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3-flash-preview",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
     ]
     selected_model = str(selected_model or "").replace("models/", "")
-    selected = [] if any(marker in selected_model.lower() for marker in blocked_markers) else [selected_model]
+    selected = [selected_model] if selected_model in usable else []
     preferred = [name for name in preferred_names if name in usable]
     ordered = selected + preferred + [m for m in usable if "flash" in m.lower()] + usable
     seen = set()
     return [m for m in ordered if m and m not in seen and not seen.add(m)]
 
 
-def is_usable_story_map(story_map, video_duration_min):
-    """Validate extraction structure without spending another API request."""
-    event_count = len(re.findall(r"\[EVENT=\d+:\d+-\d+:\d+\]", story_map or "", re.IGNORECASE))
-    minimum_events = 1 if float(video_duration_min) <= 5 else 2
-    return event_count >= minimum_events
+def resolve_selected_gemini_model(model_name):
+    """Use the UI-selected model verbatim, with a default only when empty."""
+    selected = str(model_name or "").replace("models/", "").strip()
+    return selected or "gemini-3.1-flash-lite"
+
+
+def is_transient_gemini_error(error):
+    """Return True only for temporary server/capacity failures, never quota errors."""
+    message = str(error or "").lower()
+    if any(marker in message for marker in ("429", "resource_exhausted", "quota")):
+        return False
+    return any(marker in message for marker in (
+        "503", "unavailable", "high demand", "temporarily", "internal",
+        "500", "502", "504", "deadline exceeded", "remoteprotocolerror",
+        "server disconnected", "connection reset", "connection aborted",
+        "readerror", "connecterror", "timeout",
+    ))
+
+
+def is_per_minute_gemini_quota_error(error):
+    """Retry only rolling per-minute quota, never daily/project exhaustion."""
+    message = str(error or "").lower().replace("_", "")
+    if any(marker in message for marker in (
+        "perdayperproject", "requestsperdayperproject", "per day per project",
+    )):
+        return False
+    return (
+        ("429" in message or "resourceexhausted" in message)
+        and any(marker in message for marker in (
+            "perminute", "per minute", "retrydelay", "inputtokencount",
+        ))
+    )
+
+
+def is_daily_project_gemini_quota_error(error):
+    """Detect only daily per-project exhaustion, which can use the next key."""
+    message = str(error or "").lower().replace("_", "")
+    if not ("429" in message or "resourceexhausted" in message):
+        return False
+    return any(marker in message for marker in (
+        "perdayperproject",
+        "requestsperdayperproject",
+        "per day per project",
+        "generatedrequestsperdayperprojectpermodel",
+        "generaterequestsperdayperprojectpermodel",
+    ))
+
+
+def gemini_retry_delay_seconds(error, attempt):
+    """Honor Google's RetryInfo when present, otherwise use bounded backoff."""
+    message = str(error or "")
+    matches = re.findall(
+        r"(?:retry(?:Delay| in)?[^0-9]{0,20})(\d+(?:\.\d+)?)\s*s",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if matches:
+        return min(90.0, max(1.0, float(matches[-1]) + 1.0))
+    return min(45.0, 5.0 * (2 ** max(0, int(attempt))))
+
+
+def upload_gemini_file_with_recovery(
+    client, file_path, label="video", update_progress=None,
+    max_attempts=5, sleep_fn=time.sleep,
+):
+    """Upload a Gemini file with the same transport recovery as generation."""
+    last_error = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            return client.files.upload(file=file_path)
+        except Exception as exc:
+            last_error = exc
+            retryable = (
+                is_transient_gemini_error(exc)
+                or is_per_minute_gemini_quota_error(exc)
+            )
+            if not retryable or attempt + 1 >= max_attempts:
+                raise
+            delay = gemini_retry_delay_seconds(exc, attempt)
+            if update_progress is not None:
+                update_progress(
+                    f"Ket noi upload {label} bi ngat; thu lai "
+                    f"{attempt + 2}/{max_attempts} sau {int(math.ceil(delay))} giay..."
+                )
+            sleep_fn(delay)
+    raise last_error or RuntimeError(f"Upload {label} that bai.")
+
+
+def generate_gemini_text_with_recovery(
+    client, model, contents, config, label, update_progress=None,
+    stream=False, max_attempts=3, sleep_fn=time.sleep,
+):
+    """Generate text with streaming and bounded recovery for transport/TPM errors."""
+    last_error = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            if stream:
+                parts = []
+                for chunk in client.models.generate_content_stream(
+                    model=model, contents=contents, config=config
+                ):
+                    chunk_text = str(getattr(chunk, "text", "") or "")
+                    if chunk_text:
+                        parts.append(chunk_text)
+                result_text = "".join(parts).strip()
+            else:
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                result_text = str(getattr(response, "text", "") or "").strip()
+            if not result_text:
+                raise RuntimeError("Gemini tra ve noi dung rong.")
+            return result_text
+        except Exception as exc:
+            last_error = exc
+            retryable = (
+                is_transient_gemini_error(exc)
+                or is_per_minute_gemini_quota_error(exc)
+            )
+            if not retryable or attempt + 1 >= max_attempts:
+                raise
+            delay = gemini_retry_delay_seconds(exc, attempt)
+            remaining = delay
+            while remaining > 0:
+                if update_progress is not None:
+                    update_progress(
+                        f"{label} tam gian doan; tu thu lai sau {int(math.ceil(remaining))} giay..."
+                    )
+                step = min(5.0, remaining)
+                sleep_fn(step)
+                remaining -= step
+    raise last_error or RuntimeError(f"{label} that bai.")
+
+
+def is_gemini_auth_error(error):
+    """Return True for credentials/permission failures that no model can repair."""
+    message = str(error or "").lower()
+    return any(marker in message for marker in (
+        "api_key_invalid", "api key not valid", "invalid api key",
+        "unauthenticated", "permission_denied", "permission denied",
+    )) or re.search(r"(?:^|\D)(?:401|403)(?:\D|$)", message) is not None
+
+
+def wait_for_gemini_file(
+    client, file_name, max_wait_seconds=900, poll_interval=5,
+    sleep_fn=time.sleep, on_wait=None,
+):
+    """Wait for an uploaded Gemini file; never treat a 404 as ACTIVE."""
+    waited = 0
+    while waited < max_wait_seconds:
+        try:
+            info = client.files.get(name=file_name)
+            state = getattr(info, "state", "")
+            state_name = str(getattr(state, "name", state) or "").upper()
+            if state_name == "ACTIVE":
+                return info
+            if state_name == "FAILED":
+                raise RuntimeError("Gemini khong the xu ly file video.")
+        except Exception as exc:
+            error_text = str(exc)
+            if is_gemini_auth_error(exc):
+                raise
+            if not (
+                "404" in error_text
+                or "not found" in error_text.lower()
+                or is_transient_gemini_error(exc)
+            ):
+                raise
+        sleep_fn(poll_interval)
+        waited += poll_interval
+        if on_wait is not None:
+            on_wait(waited, max_wait_seconds)
+    raise RuntimeError(
+        f"Qua {max_wait_seconds} giay nhung file video Gemini van chua ACTIVE."
+    )
+
+
+def validate_gemini_api_key(api_key):
+    """Reject only values that cannot safely be placed in an HTTP header."""
+    key = str(api_key or "").strip()
+    if not key:
+        return "API Key khong duoc bo trong."
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        return (
+            "API Key co ky tu Unicode (vi du chu tieng Viet hoac dau ngoac la). "
+            "Hay xoa key hien tai va dan lai key goc tu Google AI Studio."
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        return "API Key co ky tu dieu khien khong hop le. Hay dan lai key goc."
+    return ""
+
+
+def ascii_upload_filename(filename):
+    """Convert an uploaded basename to a safe, readable ASCII filename."""
+    basename = os.path.basename(str(filename or "").replace("\\", "/"))
+    stem, extension = os.path.splitext(basename)
+    stem = stem.replace("đ", "d").replace("Đ", "D")
+    stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode("ascii")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_") or "upload"
+    extension = re.sub(r"[^A-Za-z0-9.]", "", extension).lower()
+    return f"{stem}{extension}"
+
+
+def available_upload_path(directory, filename):
+    """Return a non-existing destination so an upload never overwrites a file."""
+    stem, extension = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem}_{counter}{extension}")
+        counter += 1
+    return candidate
+
+
+def normalize_video_file(directory, filename):
+    """Rename one existing video to ASCII and return its current basename."""
+    original = os.path.basename(str(filename or "").replace("\\", "/"))
+    source = os.path.join(directory, original)
+    if not original or not os.path.isfile(source):
+        return original
+    normalized = ascii_upload_filename(original)
+    if normalized == original:
+        return original
+    target = available_upload_path(directory, normalized)
+    os.replace(source, target)
+    return os.path.basename(target)
+
+
+def normalize_existing_video_filenames(directory):
+    """Normalize every supported video already present in the tool directory."""
+    normalized = []
+    for filename in os.listdir(directory):
+        if os.path.splitext(filename)[1].lower() not in ALLOWED_VIDEO_EXT:
+            continue
+        normalized.append(normalize_video_file(directory, filename))
+    return sorted(normalized, key=str.casefold)
+
+
+def stage_gemini_upload(file_path, staging_dir, safe_stem):
+    """Expose an upload through an ASCII-only path for strict HTTP clients."""
+    source = os.path.abspath(file_path)
+    extension = os.path.splitext(source)[1].lower() or ".bin"
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(safe_stem or "upload")).strip("_")
+    target = os.path.abspath(os.path.join(staging_dir, f"{safe_stem or 'upload'}{extension}"))
+    try:
+        target.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(
+            "Thu muc tam upload Gemini van chua ky tu Unicode; hay dat TEMP/TMP vao duong dan ASCII."
+        ) from exc
+    if os.path.normcase(source) != os.path.normcase(target):
+        shutil.copy2(source, target)
+    return target
+
+
+def split_video_into_three_parts(source_path, output_dir, duration_sec, ffmpeg_exe):
+    """Create three exact, clip-local MP4 files whose durations cover the source."""
+    duration_sec = max(0.01, float(duration_sec))
+    boundaries = [0.0, duration_sec / 3.0, duration_sec * 2.0 / 3.0, duration_sec]
+    proxy_fps = analysis_proxy_fps(duration_sec)
+    outputs = []
+    for index in range(3):
+        start = boundaries[index]
+        clip_duration = boundaries[index + 1] - start
+        output_path = os.path.join(output_dir, f"source_part_{index + 1}.mp4")
+        result = subprocess.run(
+            [
+                ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start:.3f}", "-i", source_path,
+                "-t", f"{clip_duration:.3f}",
+                "-vf", f"scale=-2:480,fps={proxy_fps}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-ar", "24000",
+                "-movflags", "+faststart", output_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3600,
+        )
+        if result.returncode != 0 or not os.path.isfile(output_path):
+            raise RuntimeError(f"Khong the cat video Gemini phan {index + 1}.")
+        outputs.append(output_path)
+    return boundaries, outputs
 
 
 def _bg_cleanup_loop():
@@ -344,9 +714,23 @@ threading.Thread(target=_bg_cleanup_loop, daemon=True).start()
 # =====================================================================
 # BACKGROUND TASK RUNNERS
 # =====================================================================
-def analyze_video_bg(
+def normalize_simple_gemini_timeline(script_text, video_duration_sec):
+    """Apply only the minimum formatting and timestamp safety needed by rendering."""
+    timeline = str(script_text or "").strip()
+    timeline = format_timeline_rows(timeline)
+    timeline = remove_non_story_timeline_rows(timeline)
+    timeline = clamp_final_timeline_end(timeline, video_duration_sec)
+    timeline = repair_nonpositive_timeline_ranges(timeline, video_duration_sec)
+    timeline = trim_timeline_ends_to_locked_starts(timeline)
+    validate_timeline_ranges(timeline, video_duration_sec)
+    if not timeline.strip():
+        raise ValueError("Gemini khong tra ve dong TIME hop le.")
+    return timeline.strip()
+
+
+def _analyze_video_bg_once(
     task_id, api_key, model_name, video_filename, style, custom_prompt,
-    enable_multi_voice=False, review_minutes="auto", analysis_passes=2,
+    enable_multi_voice=False, review_minutes="auto",
 ):
     def update_prog(prog, msg):
         with task_lock:
@@ -354,7 +738,7 @@ def analyze_video_bg(
             TASKS[task_id]["message"] = msg
 
     compressed_path = ""
-    storyboard_dir = ""
+    upload_staging_dir = ""
     remote_files = []
     client = None
 
@@ -371,8 +755,8 @@ def analyze_video_bg(
                 os.remove(compressed_path)
             except OSError:
                 pass
-        if storyboard_dir and os.path.isdir(storyboard_dir):
-            shutil.rmtree(storyboard_dir, ignore_errors=True)
+        if upload_staging_dir and os.path.isdir(upload_staging_dir):
+            shutil.rmtree(upload_staging_dir, ignore_errors=True)
 
     try:
         video_path = os.path.join(WORKSPACE_DIR, video_filename)
@@ -380,605 +764,541 @@ def analyze_video_bg(
             raise FileNotFoundError(f"Khong tim thay video: {video_filename}")
 
         update_prog(10, "Dang cau hinh ket noi API Gemini...")
-        client = genai.Client(api_key=api_key)
+        from google.genai import types as genai_types
+        generation_http_opts = genai_types.HttpOptions(
+            # One stalled generation must not hold the UI for 15 minutes per
+            # attempt. Two bounded attempts below still recover transient
+            # failures without turning one request into a 45-minute wait.
+            timeout=8 * 60 * 1000,
+            retry_options=genai_types.HttpRetryOptions(
+                # Recovery is owned by generate_gemini_text_with_recovery.
+                # Keep the SDK from multiplying the same request internally.
+                attempts=1,
+                initial_delay=1.0,
+                max_delay=30.0,
+                exp_base=2.0,
+                jitter=1.0,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
+            ),
+        )
+        client = genai.Client(api_key=api_key, http_options=generation_http_opts)
+        upload_staging_dir = tempfile.mkdtemp(prefix=f"gemini_{task_id[:8]}_")
 
-        # === Nen video truoc khi upload ===
-        update_prog(15, "Dang nen video de upload nhanh hon...")
+        # One analysis format for every source duration. This copy preserves
+        # the complete timeline; only spatial/temporal bitrate is reduced.
+        update_prog(15, "Dang tao ban nen Gemini 480p voi FPS thich ung...")
         from video_renderer import get_ffmpeg_exe, get_video_info
         ffmpeg_exe = get_ffmpeg_exe()
         
-        compressed_path = video_path.rsplit('.', 1)[0] + f"_gemini_{task_id}.mp4"
+        compressed_path = os.path.join(upload_staging_dir, "source_proxy.mp4")
         try:
-            orig_dur, orig_w, orig_h = get_video_info(video_path)
+            video_duration_sec, _, _ = get_video_info(video_path)
+            proxy_fps = analysis_proxy_fps(video_duration_sec)
             orig_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            need_compress = orig_size_mb > 50 or orig_h > 720
-            
-            if need_compress:
-                update_prog(12, f"Dang nen video ({orig_size_mb:.0f}MB -> nho hon)... Co the mat vai phut.")
-                
-                # Gemini samples video independently. Keep enough source detail
-                # for faces/text while avoiding wasteful upload frame rates.
-                if orig_dur > 1800:  # > 30 phut
-                    crf_val = "30"
-                    audio_br = "64k"
-                    target_fps = "12"
-                    scale_h = 720
-                elif orig_dur > 600:  # > 10 phut
-                    crf_val = "29"
-                    audio_br = "64k"
-                    target_fps = "12"
-                    scale_h = 720
-                else:
-                    crf_val = "28"
-                    audio_br = "96k"
-                    target_fps = "12"
-                    scale_h = 720
-                
-                scale_filter = f"scale=-2:{scale_h}" if orig_h > scale_h else ""
-                vf_parts = [f for f in [scale_filter] if f]
-                vf_arg = ["-vf", ",".join(vf_parts)] if vf_parts else []
-                
-                cmd_compress = [
-                    ffmpeg_exe, "-y",
-                    "-i", video_path,
-                    *vf_arg,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", crf_val,
-                    "-c:a", "aac", "-b:a", audio_br,
-                    "-r", target_fps,
-                    compressed_path
-                ]
-                res = subprocess.run(cmd_compress, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     timeout=1800)  # Timeout 30 phut cho nen
-                
-                if res.returncode == 0 and os.path.exists(compressed_path):
-                    compressed_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-                    update_prog(18, f"Da nen: {orig_size_mb:.0f}MB -> {compressed_mb:.0f}MB")
-                    upload_path = compressed_path
-                else:
-                    upload_path = video_path
+            update_prog(12, f"Dang nen video {orig_size_mb:.0f}MB o {proxy_fps} FPS, giu nguyen timeline...")
+            cmd_compress = [
+                ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", video_path,
+                "-vf", f"scale=-2:480,fps={proxy_fps}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-ar", "24000",
+                "-movflags", "+faststart",
+                compressed_path,
+            ]
+            res = subprocess.run(
+                cmd_compress,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3600,
+            )
+            if res.returncode == 0 and os.path.exists(compressed_path):
+                compressed_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+                update_prog(18, f"Da nen Gemini: {orig_size_mb:.0f}MB -> {compressed_mb:.0f}MB")
+                upload_path = compressed_path
             else:
                 upload_path = video_path
         except subprocess.TimeoutExpired:
-            update_prog(18, "Nen video qua lau, dung file goc...")
+            update_prog(18, "Nen trung gian qua lau; se tai file goc len Gemini...")
             upload_path = video_path
         except Exception:
             upload_path = video_path
 
-        update_prog(20, "Dang tai video len Gemini...")
-        import time
-        
-        # Cau hinh timeout theo dung luong file
-        upload_size_mb = os.path.getsize(upload_path) / (1024 * 1024)
-        upload_timeout = max(120, int(upload_size_mb * 3))  # ~3s/MB, toi thieu 2 phut
-        
-        from google.genai import types as genai_types
-        http_opts = genai_types.HttpOptions(timeout=upload_timeout * 1000)  # ms
-        client_upload = genai.Client(api_key=api_key, http_options=http_opts)
-        
-        update_prog(20, f"Dang tai video ({upload_size_mb:.0f}MB) len Gemini...")
-        
-        # Upload voi retry cho 429 + connection errors
-        video_file = None
-        last_upload_error = None
-        for upload_attempt in range(5):
-            try:
-                video_file = client_upload.files.upload(file=upload_path)
-                remote_files.append(video_file)
-                break
-            except Exception as upload_err:
-                last_upload_error = upload_err
-                err_str = str(upload_err)
-                print(f"[!] Upload lan {upload_attempt+1}/5 that bai: {err_str[:200]}")
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                    wait_sec = 30 * (upload_attempt + 1)
-                    update_prog(20, f"Het quota tam thoi, cho {wait_sec}s roi thu lai...")
-                    time.sleep(wait_sec)
-                elif any(k in err_str for k in ["10053", "ReadError", "ConnectionError", "ConnectionReset"]) or "aborted" in err_str.lower() or "timeout" in err_str.lower():
-                    wait_sec = 10 * (upload_attempt + 1)
-                    update_prog(20, f"Ket noi bi ngat, thu lai lan {upload_attempt+2}/5... ({wait_sec}s)")
-                    time.sleep(wait_sec)
-                else:
-                    raise
-        if video_file is None:
-            err_detail = str(last_upload_error)[:200] if last_upload_error else "Unknown"
-            if "429" in err_detail or "quota" in err_detail.lower():
-                raise Exception("Da het quota API mien phi! Quota tu reset sau 24h.")
-            else:
-                raise Exception(f"Upload that bai sau 5 lan. Loi: {err_detail}")
-        
-        # Doi file ACTIVE - voi retry cho files.get 404
-        update_prog(40, "Dang cho Gemini xu ly video...")
-        max_wait = 900  # 15 phut cho video dai
-        waited = 0
-        file_ready = False
-        while waited < max_wait:
-            try:
-                file_info = client.files.get(name=video_file.name)
-                state_name = file_info.state.name if hasattr(file_info.state, 'name') else str(file_info.state)
-                if state_name == "ACTIVE":
-                    file_ready = True
-                    break
-                elif state_name == "FAILED":
-                    raise Exception("Gemini khong the xu ly video.")
-            except Exception as poll_err:
-                if "404" in str(poll_err) or "Not Found" in str(poll_err):
-                    if waited >= 30:
-                        file_ready = True  # Skip polling, try generate directly
-                        break
-                elif "xu ly video" in str(poll_err):
-                    raise
-            time.sleep(5)
-            waited += 5
-            pct = 40 + min(waited // 15, 25)
-            update_prog(pct, f"Dang xu ly video... ({waited}s/{max_wait}s)")
-        
-        if not file_ready and waited >= max_wait:
-            pass  # Try generate anyway
-
-        update_prog(70, "Video da san sang! Dang tao kich ban...")
-        
-        # TINH TOAN DO DAI KICH BAN — Tang do dai de khong bo sot chi tiet
-        from video_renderer import get_video_info
         video_duration_sec, _, _ = get_video_info(video_path)
-        video_duration_min = max(1, video_duration_sec / 60)
-        
-        target_review_min, target_word_count, min_word_count, max_word_count = calculate_script_budget(
-            video_duration_min, review_minutes, style
+        import time
+
+        # Use the bounded review budget selected by the user. Auto mode is
+        # intentionally capped at 20 minutes.
+        (
+            target_recap_minutes,
+            target_recap_words,
+            min_recap_words,
+            max_recap_words,
+        ) = calculate_script_budget(
+            video_duration_sec / 60.0,
+            review_minutes=review_minutes,
+            style=style,
         )
-            
-        style_choice = str(style).lower()
-        if style_choice == "humorous" or "hài hước" in style_choice or "giải trí" in style_choice:
-            pacing_instruction = (
-                "=== ĐỊNH HƯỚNG TẤU HÀI (BẮT BUỘC) ===\n"
-                "- Văn phong: Vui nhộn, bắt trend, nhịp nhanh, đầy năng lượng.\n"
-                "- Sau mỗi pha hài, dùng câu bình luận mỉa mai hoặc cà khịa ngay lập tức. Giọng đọc LIÊN TỤC, không ngắt quãng.\n"
-            )
-        elif style_choice == "action" or "hành động" in style_choice or "thử thách" in style_choice or "100 ngày" in style_choice:
-            pacing_instruction = (
-                "=== ĐỊNH HƯỚNG HÀNH ĐỘNG & SINH TỒN (BẮT BUỘC) ===\n"
-                "- Câu CỰC NGẮN (8-15 từ), dứt khoát, động từ mạnh.\n"
-                "- Giọng đọc LIÊN TỤC không nghỉ, tạo cảm giác nghẹt thở. Dùng dấu phẩy và dấu chấm để tạo nhịp thay vì khoảng lặng.\n"
-            )
-        elif style_choice == "news" or "tin tức" in style_choice or "bản tin" in style_choice or "cập nhật" in style_choice:
-            pacing_instruction = (
-                "=== ĐỊNH HƯỚNG BẢN TIN (BẮT BUỘC) ===\n"
-                "- Nhịp đọc đĩnh đạc, rõ ràng, thông tin cao. KHÔNG cường điệu.\n"
-                "- Câu khúc chiết 12-18 từ, thuật ngữ chuẩn. Giọng đọc LIÊN TỤC mượt mà.\n"
-            )
-        elif style_choice == "tutorial" or "hướng dẫn" in style_choice or "review" in style_choice or "đánh giá" in style_choice or "cách làm" in style_choice:
-            pacing_instruction = (
-                "=== ĐỊNH HƯỚNG HƯỚNG DẪN (BẮT BUỘC) ===\n"
-                "- Trình bày theo trình tự logic, mạch lạc.\n"
-                "- Văn phong sư phạm, tận tình, dễ hiểu. Giọng đọc LIÊN TỤC, dùng dấu chấm câu tạo nhịp.\n"
-            )
-        else: # Mặc định cho dramatic / Kịch tính / Kinh dị
-            pacing_instruction = (
-                "=== NHỊP ĐIỆU KỂ CHUYỆN (BẮT BUỘC) ===\n"
-                "- Giọng đọc LIÊN TỤC như YouTuber recap chuyên nghiệp. KHÔNG có khoảng lặng dài.\n"
-                "- Tạo kịch tính bằng TỪ NGỮ và CÂU VĂN, không phải bằng im lặng.\n"
-                "- Dùng dấu ba chấm '...' khi muốn tạo hồi hộp, dùng dấu chấm than '!' khi muốn nhấn mạnh.\n"
-                "- TUYỆT ĐỐI KHÔNG chèn thẻ <BREAK>, <break>, hay bất kỳ thẻ ngắt nghỉ nào. Chỉ viết văn bản thuần túy.\n"
-            )
-        multi_voice_instruction = ""
-        if enable_multi_voice:
-            multi_voice_instruction = (
-                "=== ĐỊNH HƯỚNG ĐA GIỌNG ĐỌC (MULTI-VOICE) (BẮT BUỘC) ===\n"
-                "Kịch bản này phải được viết dưới dạng một cuộc ĐỐI THOẠI HẤP DẪN giữa 2 người (1 Nam, 1 Nữ) cùng nhau bình luận/kể lại bộ phim.\n"
-                "Hãy sử dụng chính xác thẻ lệnh đặt ở đầu mỗi câu nói để phân vai:\n"
-                "- Dùng thẻ [VOICE=vi-VN-NamMinhNeural] cho giọng Nam.\n"
-                "- Dùng thẻ [VOICE=vi-VN-HoaiMyNeural] cho giọng Nữ.\n"
-                "Đan xen 2 giọng nhịp nhàng. Ví dụ:\n"
-                "[VOICE=vi-VN-NamMinhNeural] Thật không thể tin nổi, anh ta đã nhảy xuống vách đá!\n"
-                "[VOICE=vi-VN-HoaiMyNeural] Đúng vậy, nhưng hãy nhìn kỹ xem phía dưới có gì kìa...\n\n"
-            )
-            
-        custom_section = f"\n=== YÊU CẦU BỔ SUNG ===\n{custom_prompt}\n" if custom_prompt.strip() else ""
-        
-        max_story_events = min(100, max(12, int(video_duration_min * 0.65)))
-        story_map_prompt = (
-            "=== NHIỆM VỤ DUY NHẤT: LẬP BẢN ĐỒ CỐT TRUYỆN ===\n"
-            f"Xem toàn bộ video dài {video_duration_min:.0f} phút và ghi lại tối đa "
-            f"{max_story_events} sự kiện quan trọng. CHƯA viết lời review, không dùng văn phong YouTube.\n\n"
-            "Bản đồ này sẽ là nguồn sự thật duy nhất để một lượt AI khác viết kịch bản. "
-            "Vì vậy phải ưu tiên đúng sự kiện, đúng nhân vật và đúng thứ tự hơn lời văn hay.\n\n"
-            "Xuất đúng các mục sau bằng văn bản ngắn gọn:\n"
-            "NHÂN VẬT: tên/cách gọi ổn định, đặc điểm nhận diện và vai trò. Nếu chưa biết tên, "
-            "dùng một cách gọi mô tả cố định; tuyệt đối không tự đặt tên.\n"
-            "SỰ KIỆN: mỗi dòng theo mẫu [EVENT=mm:ss-mm:ss] Nhân vật | hành động nhìn/nghe thấy "
-            "| nguyên nhân trực tiếp | kết quả trực tiếp.\n"
-            "KẾT THÚC: sự kiện kết thúc thật của câu chuyện và timestamp của nó.\n\n"
-            "Quy tắc bắt buộc:\n"
-            "- Theo đúng trình tự thời gian từ đầu đến kết thúc câu chuyện.\n"
-            "- Bao phủ mở đầu, các bước ngoặt, cao trào và kết quả cuối; không dồn hết sự kiện vào đầu video.\n"
-            "- Chỉ ghi điều thực sự có trong hình ảnh hoặc âm thanh. Không suy đoán động cơ, quan hệ hay tên riêng.\n"
-            "- Giữ nhất quán cách gọi nhân vật xuyên suốt.\n"
-            "- Bỏ logo, quảng cáo, intro, credit và màn hình kết thúc.\n"
-            "- Mỗi sự kiện chỉ chứa một hành động chính và timestamp phải đúng cảnh.\n"
-            "- Không Markdown, không nhận xét, không viết kịch bản review.\n"
-        )
-        
-        prompt = (
-            f"=== NHIỆM VỤ ===\n"
-            f"Bạn là YouTuber recap chuyên nghiệp. Video gốc {video_duration_min:.0f} phút.\n"
-            f"Dựa hoàn toàn trên NGUỒN SỰ KIỆN được cung cấp. Nếu nguồn là BẢN ĐỒ CỐT TRUYỆN, "
-            f"đó là nguồn sự thật duy nhất: không thêm nhân vật, hành động, nguyên nhân hoặc kết quả ngoài bản đồ.\n"
-            f"Viết kịch bản khoảng {min_word_count}-{max_word_count} từ kể trọn phần CÂU CHUYỆN thực tế.\n"
-            f"Mục tiêu: Người xem HIỂU TRỌN VẸN câu chuyện mà KHÔNG CẦN xem video gốc.\n"
-            f"Viết LÔI CUỐN, HẤP DẪN — không cần kể chi tiết từng cảnh, chỉ cần kể ĐÚNG và HAY.\n\n"
-            
-            f"=== NGÂN SÁCH TỪ (CỰC KỲ QUAN TRỌNG) ===\n"
-            f"Ngân sách tối đa khoảng {target_word_count} từ cho phần CÂU CHUYỆN.\n"
-            f"Phân bổ lời kể theo các sự kiện, không phân bổ theo độ dài toàn file.\n"
-            f"Logo và credit không được nhận bất kỳ ngân sách từ nào.\n\n"
-            
-            f"=== CÁCH VIẾT ===\n"
-            f"1. ĐỌC/XEM toàn bộ nguồn sự kiện để xác định chính xác lúc CÂU CHUYỆN bắt đầu và kết thúc.\n"
-            f"2. Chọn ra các SỰ KIỆN CHÍNH (bước ngoặt, nguy hiểm, thành tựu, kết quả).\n"
-            f"3. Kể lại TUẦN TỰ theo thời gian, BỎ QUA những phần nhàm chán/lặp lại.\n"
-            f"4. Tập trung vào DIỄN BIẾN và CẢM XÚC, không liệt kê chi tiết.\n"
-            f"5. Kể đến KẾT THÚC CÂU CHUYỆN, rồi DỪNG ngay tại đó.\n"
-            f"6. BỎ HOÀN TOÀN logo, tiêu đề mở đầu, màn hình đen/trắng, credit, tên đạo diễn, diễn viên, đoàn làm phim, hãng sản xuất và website.\n"
-            f"7. KHÔNG viết lời mô tả cho phần credit dù nó nằm ở cuối file video.\n\n"
-            
-            f"=== CẤU TRÚC ===\n"
-            f"Vào thẳng SỰ KIỆN ĐẦU TIÊN của câu chuyện tại timestamp thật của nó. KHÔNG bắt buộc bắt đầu từ 00:00.\n"
-            f"Kể chuyện LIÊN TỤC như đang nói cho bạn bè nghe — tự nhiên, cuốn hút.\n\n"
-            
-            f"{multi_voice_instruction}"
-            
-            f"=== ĐỘ CHÍNH XÁC (TỐI QUAN TRỌNG) ===\n"
-            f"Mỗi câu văn sẽ được GHÉP VỚI KHUNG HÌNH VIDEO tại đúng mốc timestamp đó.\n"
-            f"Nếu câu văn nói về 'chiến đấu với zombie' nhưng khung hình cho thấy 'đang xây nhà' → SAI!\n\n"
-            f"QUY TẮC VÀNG:\n"
-            f"- Mỗi câu PHẢI mô tả đúng những gì ĐANG XẢY RA TẠI TIMESTAMP ĐÓ.\n"
-            f"- KHÔNG được bịa: KHÔNG thêm đồ vật, hành động không có trong video.\n"
-            f"- Nếu không rõ → MIÊU TẢ CHUNG ('một cấu trúc', 'một sinh vật'), KHÔNG đoán bừa.\n"
-            f"- SAI: 'Xây một cái nhà' khi thực tế đang đào hầm.\n"
-            f"- ĐÚNG: Chỉ viết những gì nguồn sự kiện XÁC NHẬN RÕ RÀNG tại mốc thời gian đó.\n\n"
-            
-            f"=== NHẬN DẠNG MINECRAFT (THAM KHẢO) ===\n"
-            f"Nếu video là Minecraft, hãy gọi đúng tên các entity phổ biến:\n"
-            f"- Sinh vật mũi dài, tay chắp, mặc áo nâu/trắng/tím = DÂN LÀNG (Villager), KHÔNG phải 'thực thể kỳ lạ'\n"
-            f"- Sinh vật cao, đen, mắt tím, dịch chuyển = ENDERMAN\n"
-            f"- Sinh vật xanh lá, 4 chân, phát nổ = CREEPER\n"
-            f"- Sinh vật xương trắng, cầm cung = SKELETON\n"
-            f"- Sinh vật xanh, thối rữa, chậm chạp = ZOMBIE\n"
-            f"- Sinh vật khổng lồ, sắt, bảo vệ làng = IRON GOLEM\n"
-            f"- Sinh vật khổng lồ, tối, ở Deep Dark, gầm rú = WARDEN\n"
-            f"- Sinh vật bay, trắng, bắn lửa = GHAST\n"
-            f"- Rồng đen, ở The End = ENDER DRAGON\n"
-            f"- Sinh vật 3 đầu, bay, bắn sọ = WITHER\n"
-            f"- Nếu là mod/custom thì miêu tả hình dáng: 'sinh vật mang mặt nạ', 'quái vật biến dạng'\n\n"
-            
-            f"=== TIMELINE CÂU CHUYỆN ===\n"
-            f"Video nguồn dài {video_duration_min:.0f} phút nhưng có thể chứa logo và credit.\n"
-            f"- Chỉ phân bổ lời kể trong khoảng có diễn biến câu chuyện.\n"
-            f"- Timestamp đầu là sự kiện đầu tiên; timestamp cuối là kết quả cuối cùng của câu chuyện.\n"
-            f"- Không kéo timeline tới cuối file nếu sau câu chuyện chỉ còn credit hoặc màn hình kết.\n\n"
-            
-            f"=== TIMESTAMP (CHÍNH XÁC) ===\n"
-            f"- Giữ mỗi câu kể tự nhiên trong MỘT dòng để TTS đọc liền mạch.\n"
-            f"- Cảnh đầu câu dùng [TIME=START-END]. Nếu cùng câu xuất hiện hành động mới, chèn [BEAT=START-END] ngay trước cụm từ mô tả hành động đó.\n"
-            f"- Ví dụ: [TIME=01:20-01:24] Luke nhặt mảnh xương lên, [BEAT=01:27-01:31] rồi phát hiện dấu chân gấu trên cát.\n"
-            f"- [BEAT] chỉ điều khiển hình ảnh, không được làm cắt vụn câu văn hoặc lặp lại lời kể.\n"
-            f"- MỖI CỤM HÀNH ĐỘNG phải có [TIME=mm:ss-mm:ss] hoặc [BEAT=mm:ss-mm:ss]: vùng hình ảnh chứng minh đúng hành động đang kể.\n"
-            f"- Mỗi [TIME=] bắt đầu MỘT câu kể mới; [BEAT=] nằm trong câu đó tại đúng chỗ lời kể chuyển sang hành động mới.\n"
-            f"- Một cụm được phép có 1-3 câu tự nhiên nếu chúng cùng nhân vật, cùng sự kiện và diễn ra liên tiếp.\n"
-            f"- Một range chỉ nên chứa MỘT hành động hình ảnh chính. Nếu lời kể có hai hành động liên tiếp, phải tách thành hai range START-END liên tiếp.\n"
-            f"- Không chia quá 2 range cho một câu và không tạo range ngắn hơn 1,5 giây, trừ montage hành động nhanh.\n"
-            f"- Không tách một ý đang liền mạch thành nhiều câu cụt chỉ để ép vừa số giây.\n"
-            f"- Không dùng chung một timestamp cho nhiều hành động khác nhau nếu chúng xảy ra ở thời điểm khác nhau.\n"
-            f"- START phải nhỏ hơn END; range sau không được đi lùi hoặc chồng lên range trước.\n"
-            f"- TIME_END là biên tham chiếu của hình ảnh, KHÔNG phải giới hạn cứng để cắt hoặc tăng tốc lời đọc.\n"
-            f"- Viết đủ ý bằng câu hoàn chỉnh; hệ thống sẽ cho cảnh tiếp tục chạy nếu lời đọc dài hơn range.\n"
-            f"- Range phải CHÍNH XÁC với lúc hành động diễn ra, KHÔNG đoán và dừng trước credit cuối phim.\n"
-            
-            f"=== CHẤT LƯỢNG VIẾT ===\n"
-            f"- Văn bản thuần túy. KHÔNG markdown. KHÔNG thẻ BREAK.\n"
-            f"- Câu 8-20 từ. Ngắn gọn, dứt khoát.\n"
-            f"- Viết như đang KỂ CHUYỆN cho bạn bè: tự nhiên, cuốn hút, liền mạch.\n"
-            f"- Dùng CHI TIẾT CỤ THỂ thay vì mô tả chung: 'rơi xuống hố dung nham sâu thẳm' thay vì 'gặp nguy hiểm'.\n"
-            f"- Chuyển cảnh MƯỢT: 'Nhưng đó mới chỉ là khởi đầu...', 'Tưởng đã an toàn, nhưng...'\n"
-            f"- Giọng đọc LIÊN TỤC. Dùng dấu ba chấm '...' tạo hồi hộp, dấu '!' nhấn mạnh.\n\n"
-            
-            f"{pacing_instruction}\n"
-            
-            f"=== CẤM ===\n"
-            f"- CẤM in từ khóa cấu trúc (HOOK, BUILD-UP, PAYOFF).\n"
-            f"- CẤM chèn thẻ <BREAK>, <break time>, hay bất kỳ thẻ ngắt nghỉ.\n"
-            f"- CẤM bịa sự kiện không có trong video.\n"
-            f"- CẤM gọi sai tên mob/vật phẩm.\n\n"
-            
-            f"NHẮC LẠI: Mỗi câu dùng [TIME=START-END] cho cảnh đầu và [BEAT=START-END] cho các hành động tiếp theo; lời kể vẫn phải đầy đủ, tự nhiên. Tuyệt đối không kể logo/credit.\n"
-            f"{custom_section}"
-            f"Bây giờ hãy viết kịch bản:"
+        part_word_targets = three_part_targets(target_recap_words)
+        update_prog(20, "Dang cat ban nen thanh 3 phan bang nhau...")
+        boundaries, part_paths = split_video_into_three_parts(
+            upload_path, upload_staging_dir, video_duration_sec, ffmpeg_exe
         )
 
-        # Two calls by default, three only when explicitly selected:
-        # source video -> story map -> local SHOT_ID reel -> locked narration.
-        try:
-            available_models = [m.name.replace("models/", "") if hasattr(m, 'name') else str(m) for m in client.models.list() if "gemini" in (m.name.replace("models/", "") if hasattr(m, 'name') else str(m)).lower()]
-        except Exception:
-            available_models = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-
-        unique_models = build_model_candidates(model_name, available_models)
-        if not unique_models:
-            raise Exception("Khong tim thay model Gemini Flash ho tro video va text.")
-        used_model = unique_models[0]
-        generation_call_count = 0
-        max_generation_calls = 3 if int(analysis_passes) == 3 else 2
-
-        def generate_once(contents, config, progress, label):
-            nonlocal generation_call_count
-            if generation_call_count >= max_generation_calls:
-                raise RuntimeError(
-                    f"Da cham gioi han {max_generation_calls} luot Gemini cho mot video."
-                )
-            generation_call_count += 1
+        selected_model = resolve_selected_gemini_model(model_name)
+        pass1_config = genai_types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=32768,
+            response_mime_type="application/json",
+        )
+        part_responses = []
+        pass1_calls = 0
+        for part_index, part_path in enumerate(part_paths):
+            part_number = part_index + 1
+            upload_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+            upload_timeout = max(120, int(upload_size_mb * 3))
+            client_upload = genai.Client(
+                api_key=api_key,
+                http_options=genai_types.HttpOptions(timeout=upload_timeout * 1000),
+            )
+            progress_base = 25 + part_index * 14
             update_prog(
-                progress,
-                f"{label} ({generation_call_count}/{max_generation_calls}) voi {used_model}...",
+                progress_base,
+                f"Dang tai phan {part_number}/3 ({upload_size_mb:.0f}MB) len Gemini...",
             )
-            result = client.models.generate_content(
-                model=used_model,
-                contents=contents,
-                config=config,
+            part_file = upload_gemini_file_with_recovery(
+                client_upload,
+                part_path,
+                label=f"video phan {part_number}/3",
+                update_progress=lambda message, p=progress_base: update_prog(p, message),
+                max_attempts=5,
             )
-            if not result or not result.text or not result.text.strip():
-                raise RuntimeError(
-                    f"Gemini khong tra ve du lieu o luot "
-                    f"{generation_call_count}/{max_generation_calls}."
+            remote_files.append(part_file)
+            wait_for_gemini_file(
+                client,
+                part_file.name,
+                max_wait_seconds=900,
+                poll_interval=5,
+                sleep_fn=time.sleep,
+                on_wait=lambda waited, limit, n=part_number, p=progress_base: update_prog(
+                    p + 3, f"Gemini dang xu ly phan {n}/3... ({waited}s/{limit}s)"
+                ),
+            )
+
+            part_uri = str(getattr(part_file, "uri", "") or "").strip()
+            part_mime = str(getattr(part_file, "mime_type", "") or "video/mp4")
+            if part_uri:
+                part_content = genai_types.Part.from_uri(
+                    file_uri=part_uri,
+                    mime_type=part_mime,
+                    media_resolution=(
+                        genai_types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW
+                    ),
                 )
-            return result
+                part_content.video_metadata = genai_types.VideoMetadata(fps=1.0)
+            else:
+                part_content = part_file
 
-        from google.genai import types as _gen_types
-        map_config = _gen_types.GenerateContentConfig(
-            max_output_tokens=20000,
-            temperature=0.15,
-        )
-        map_response = generate_once(
-            [video_file, story_map_prompt], map_config, 72,
-            "Luot 1: lap ban do cot truyen"
-        )
-        if not is_usable_story_map(map_response.text, video_duration_min):
-            raise ValueError("Luot 1 khong tao duoc ban do cot truyen co EVENT timestamp.")
-        story_map = map_response.text.strip()
-        print(f"[+] Ban do cot truyen: {len(story_map.split())} tu, model={used_model}", flush=True)
-
-        # Build immutable local shot IDs. Gemini sees a short evidence reel, not
-        # the full film, and can only select IDs generated by the backend.
-        storyboard_dir = os.path.join(WORKSPACE_DIR, f"temp_storyboard_{task_id}")
-        os.makedirs(storyboard_dir, exist_ok=True)
-        update_prog(74, "Dang phat hien ranh gioi shot that trong video...")
-        shots = detect_locked_shots(
-            video_path,
-            upload_path,
-            os.path.join(WORKSPACE_DIR, ".scene_cache"),
-        )
-        event_ranges = parse_story_event_ranges(story_map, video_duration_sec)
-        candidate_indices = choose_candidate_shots(
-            shots,
-            event_ranges,
-            video_duration_sec,
-            padding=5.0,
-            max_per_event=12,
-            max_total=900,
-        )
-        storyboard_path, candidate_shots = build_storyboard_reel(
-            upload_path,
-            shots,
-            candidate_indices,
-            storyboard_dir,
-            ffmpeg_exe,
-            update_prog,
-        )
-        print(
-            f"[+] Shot storyboard: {len(shots)} shot nguon, "
-            f"{len(candidate_shots)} shot ung vien.", flush=True
-        )
-
-        update_prog(79, "Dang tai storyboard SHOT_ID len Gemini...")
-        storyboard_file = client_upload.files.upload(file=storyboard_path)
-        remote_files.append(storyboard_file)
-        waited_storyboard = 0
-        while waited_storyboard < 600:
-            info = client.files.get(name=storyboard_file.name)
-            state_name = info.state.name if hasattr(info.state, "name") else str(info.state)
-            if state_name == "ACTIVE":
-                break
-            if state_name == "FAILED":
-                raise RuntimeError("Gemini khong the xu ly storyboard SHOT_ID.")
-            time.sleep(3)
-            waited_storyboard += 3
-        else:
-            raise RuntimeError("Storyboard SHOT_ID xu ly qua thoi gian cho.")
-
-        allowed_rows = []
-        for shot in candidate_shots:
-            shot_seconds = max(0.2, float(shot["end"]) - float(shot["start"]))
-            word_limit = max(3, min(12, int(round(shot_seconds * 2.5))))
-            allowed_rows.append(
-                f"{shot['id']} SOURCE={shot['start']:.2f}-{shot['end']:.2f} "
-                f"MAX_WORDS={word_limit}"
+            prompt = build_single_part_video_prompt(
+                part_number,
+                boundaries[part_number] - boundaries[part_index],
+                boundaries[part_index],
+                boundaries[part_number],
+                part_word_targets[part_index],
+                style=style,
+                custom_prompt=custom_prompt,
+                enable_multi_voice=enable_multi_voice,
             )
-        minimum_selected = 8 if video_duration_min > 5 else 2
-        desired_shots = min(
-            len(candidate_shots), max(minimum_selected, int(round(target_word_count / 6.0)))
-        )
-        common_shot_rules = (
-            f"Select about {desired_shots} useful SHOT_IDs from the attached storyboard reel.\n"
-            "Every storyboard panel shows BEFORE / MID / AFTER frames from one real source shot.\n"
-            "Hard rules:\n"
-            "- Use only SHOT_IDs printed in the reel and ALLOWED SHOTS list.\n"
-            "- Keep strict source chronology; never repeat or move backward.\n"
-            "- Select a shot only when its three frames visibly support the words assigned to it.\n"
-            "- Use reaction shots when the narration changes to a character reaction.\n"
-            "- Skip logos, credits and unclear panels. Do not guess missing actions.\n"
-            "- Never output TIME, timestamps, ACTION, BEAT, headings or Markdown.\n"
-        )
-        shot_voice_instruction = ""
-        if enable_multi_voice:
-            shot_voice_instruction = (
-                "For multi-voice narration, put [VOICE=vi-VN-NamMinhNeural] or "
-                "[VOICE=vi-VN-HoaiMyNeural] immediately AFTER a SHOT marker, never before it. "
-                "Example: [SHOT=S00001] [VOICE=vi-VN-NamMinhNeural] narration fragment.\n"
-            )
-
-        alignment_config = _gen_types.GenerateContentConfig(
-            max_output_tokens=65536,
-            temperature=0.2 if max_generation_calls == 2 else 0.1,
-        )
-        if max_generation_calls == 2:
-            shot_prompt = (
-                "=== PASS 2/2: SELECT LOCKED SHOTS AND WRITE VIETNAMESE NARRATION ===\n"
-                f"{common_shot_rules}\n"
-                f"Write about {min_word_count}-{max_word_count} Vietnamese words in style: {style}.\n"
-                "Output only narration fragments, each prefixed by its visual shot:\n"
-                "[SHOT=S00001] first natural clause,\n"
-                "[SHOT=S00002] next clause completing the same sentence.\n\n"
-                "A natural sentence may span 1-3 consecutive SHOT markers. Keep commas or connective "
-                "words between fragments so grouped TTS reads continuously. Respect MAX_WORDS for every "
-                "shot. Each fragment must describe the visible action/reaction in that exact shot.\n"
-                f"{pacing_instruction}\n{shot_voice_instruction}\n"
-                f"Additional instruction: {custom_prompt.strip() or 'none'}.\n\n"
-                "=== STORY MAP ===\n"
-                f"{story_map}\n\n=== ALLOWED SHOTS ===\n" + "\n".join(allowed_rows)
-            )
-            response = generate_once(
-                [storyboard_file, shot_prompt], alignment_config, 88,
-                "Luot 2: chon SHOT_ID va viet loi"
-            )
-            script_text = shot_script_to_timeline(
-                response.text, candidate_shots, minimum_shots=minimum_selected
-            )
-        else:
-            selection_prompt = (
-                "=== PASS 2/3: SELECT AND DESCRIBE LOCKED SHOTS ===\n"
-                f"{common_shot_rules}\n"
-                "Output exactly one literal visible description per selected shot:\n"
-                "[SHOT=S00001] short literal action or reaction visible in this shot\n\n"
-                "=== STORY MAP ===\n"
-                f"{story_map}\n\n=== ALLOWED SHOTS ===\n" + "\n".join(allowed_rows)
-            )
-            selection_response = generate_once(
-                [storyboard_file, selection_prompt], alignment_config, 84,
-                "Luot 2: khoa chuoi SHOT_ID"
-            )
-            selected_shots, _ = parse_shot_selection(
-                selection_response.text,
-                candidate_shots,
-                minimum_shots=minimum_selected,
-            )
-            narration_rows = []
-            for shot in selected_shots:
-                seconds = max(0.2, float(shot["end"]) - float(shot["start"]))
-                word_limit = max(3, min(12, int(round(seconds * 2.5))))
-                narration_rows.append(
-                    f"[SHOT={shot['id']} MAX_WORDS={word_limit}] {shot['description']}"
+            part_error = None
+            accepted_response = None
+            # The first response may be retried once only for malformed JSON.
+            # Missing coverage is repaired incrementally below without
+            # discarding valid scenes that Gemini already produced.
+            for part_attempt in range(2):
+                update_prog(
+                    progress_base + 7,
+                    f"Gemini dang viet phan {part_number}/3"
+                    + (" (thu lai 1/1)..." if part_attempt else "..."),
                 )
-            final_prompt = (
-                "=== PASS 3/3: WRITE NATURAL VIETNAMESE NARRATION ===\n"
-                f"Write about {min_word_count}-{max_word_count} words in style: {style}.\n"
-                "Use only the locked SHOT_IDs below, exactly once and in the given order. "
-                "A natural sentence may span 1-3 consecutive markers. Output:\n"
-                "[SHOT=S00001] narration fragment, [SHOT=S00002] next fragment.\n"
-                "Respect every MAX_WORDS value. Do not output TIME, timestamps, ACTION, BEAT, "
-                "headings, notes, Markdown or BREAK tags.\n"
-                f"{pacing_instruction}\n{shot_voice_instruction}\n"
-                f"Additional instruction: {custom_prompt.strip() or 'none'}.\n\n"
-                "=== LOCKED SHOTS ===\n" + "\n".join(narration_rows)
-            )
-            final_config = _gen_types.GenerateContentConfig(
-                max_output_tokens=65536,
-                temperature=0.35,
-            )
-            response = generate_once(
-                final_prompt, final_config, 91,
-                "Luot 3: viet loi theo SHOT_ID da khoa"
-            )
-            script_text = shot_script_to_timeline(
-                response.text, selected_shots, minimum_shots=minimum_selected
-            )
+                attempt_prompt = prompt
+                if part_attempt and part_error is not None:
+                    attempt_prompt += (
+                        "\n\nLẦN TRƯỚC KHÔNG ĐẠT: " + str(part_error)
+                        + "\nBẮT BUỘC điều chỉnh đúng số cảnh và khoảng từ đã nêu, rồi trả lại JSON hoàn chỉnh của phần này."
+                    )
+                try:
+                    pass1_calls += 1
+                    response_text = generate_gemini_text_with_recovery(
+                        client,
+                        selected_model,
+                        [part_content, attempt_prompt],
+                        pass1_config,
+                        f"Gemini phan {part_number}/3",
+                        update_progress=lambda message, p=progress_base + 7: update_prog(p, message),
+                        stream=True,
+                        max_attempts=3,
+                    )
+                    single_part_missing_requirements(
+                        response_text,
+                        boundaries[part_number] - boundaries[part_index],
+                        part_word_targets[part_index],
+                    )
+                    accepted_response = response_text
+                    break
+                except Exception as exc:
+                    part_error = exc
+                    if part_attempt:
+                        raise
 
-        validate_timeline_ranges(script_text, video_duration_sec)
-        word_count_raw = len(script_text.split())
-        print(
-            f"[+] Kich ban SHOT_ID: {word_count_raw} tu, "
-            f"{generation_call_count}/{max_generation_calls} luot, "
-            f"model={used_model}", flush=True
+            clip_duration = boundaries[part_number] - boundaries[part_index]
+            continuation_json_fallback = False
+            continuation_incomplete_fallback = False
+            for continuation_round in range(MAX_CONTINUATION_ROUNDS):
+                requirements = single_part_missing_requirements(
+                    accepted_response, clip_duration, part_word_targets[part_index]
+                )
+                if not requirements["regions"]:
+                    break
+                update_prog(
+                    progress_base + 9,
+                    f"Gemini dang viet tiep vung thieu cua phan {part_number}/3 "
+                    f"(lan {continuation_round + 1}/{MAX_CONTINUATION_ROUNDS})...",
+                )
+                continuation_prompt = build_single_part_continuation_prompt(
+                    part_number,
+                    clip_duration,
+                    part_word_targets[part_index],
+                    accepted_response,
+                    requirements,
+                )
+                if continuation_round:
+                    continuation_prompt += (
+                        "\n\nLuot bo sung truoc khong them duoc scene hop le. "
+                        "Hay chi tra cac scene moi dung region va scene_id duoc yeu cau."
+                    )
+                addition_error = None
+                added_count = 0
+                merged_response = accepted_response
+                for json_attempt in range(2):
+                    attempt_prompt = continuation_prompt
+                    if json_attempt and addition_error is not None:
+                        attempt_prompt += (
+                            "\n\nPHẢN HỒI TRƯỚC KHÔNG PHẢI JSON HỢP LỆ: "
+                            + str(addition_error)
+                            + "\nChỉ trả một JSON object hoàn chỉnh, không thêm bất kỳ chữ nào bên ngoài JSON."
+                        )
+                        update_prog(
+                            progress_base + 9,
+                            f"Gemini dang tra lai JSON bo sung phan {part_number}/3...",
+                        )
+                    pass1_calls += 1
+                    additions_text = generate_gemini_text_with_recovery(
+                        client,
+                        selected_model,
+                        [part_content, attempt_prompt],
+                        pass1_config,
+                        f"Gemini bo sung phan {part_number}/3",
+                        update_progress=lambda message, p=progress_base + 9: update_prog(p, message),
+                        stream=True,
+                        max_attempts=3,
+                    )
+                    try:
+                        merged_response, added_count = merge_single_part_additions(
+                            accepted_response,
+                            additions_text,
+                            requirements["regions"],
+                        )
+                        addition_error = None
+                        break
+                    except ValueError as exc:
+                        addition_error = exc
+
+                if addition_error is not None:
+                    print(
+                        f"[!] JSON bo sung phan {part_number} hong sau 2 lan; "
+                        "giu ket qua hien tai.",
+                        flush=True,
+                    )
+                    continuation_json_fallback = True
+                    break
+                if added_count == 0:
+                    continuation_incomplete_fallback = True
+                    print(
+                        f"[!] Bo sung phan {part_number} lan "
+                        f"{continuation_round + 1}/{MAX_CONTINUATION_ROUNDS} "
+                        "khong co scene hop le; thu luot tiep theo.",
+                        flush=True,
+                    )
+                    continue
+                accepted_response = merged_response
+                continuation_incomplete_fallback = False
+
+            remaining_requirements = single_part_missing_requirements(
+                accepted_response, clip_duration, part_word_targets[part_index]
+            )
+            if remaining_requirements["regions"]:
+                continuation_incomplete_fallback = True
+                print(
+                    f"[!] Phan {part_number} van thieu mot so region sau "
+                    f"{MAX_CONTINUATION_ROUNDS} luot; giu ket qua tot nhat va tiep tuc.",
+                    flush=True,
+                )
+            validate_single_part_response(
+                accepted_response,
+                part_number,
+                part_word_targets[part_index],
+                require_coverage=not (
+                    continuation_json_fallback or continuation_incomplete_fallback
+                ),
+            )
+            part_responses.append(accepted_response)
+
+        pass1_payload = merge_single_part_responses(
+            part_responses, boundaries, target_recap_words
         )
-        
-        # Read the final timestamp for diagnostics. Do not spend another request
-        # merely to force coverage through possible end credits.
-        parsed_ranges = [extract_time_range(row)[:2] for row in script_text.splitlines()]
-        parsed_ranges = [item for item in parsed_ranges if item[0] is not None]
-        last_ts_sec = (parsed_ranges[-1][1] or parsed_ranges[-1][0]) if parsed_ranges else 0
-        
-        print(f"[+] Timestamps tim thay: {len(parsed_ranges)}, cuoi cung: {last_ts_sec:.2f}s/{video_duration_sec:.0f}s ({last_ts_sec/video_duration_sec*100:.0f}%)", flush=True)
-        
-        # Do not auto-continue based on percentage of the source file. The tail
-        # can be end credits; Gemini must stop at the actual story conclusion.
-        print(f"[+] Khong ep kich ban ke qua logo/credit cuoi file (moc cuoi {last_ts_sec}s).", flush=True)
-        
-        # POST-PROCESSING
-        import re as re_mod
-        
-        script_text = re_mod.sub(r'\*\*(.+?)\*\*', r'\1', script_text)
-        script_text = re_mod.sub(r'\*(.+?)\*', r'\1', script_text)
-        script_text = re_mod.sub(r'__(.+?)__', r'\1', script_text)
-        script_text = re_mod.sub(r'_(.+?)_', r'\1', script_text)
-        script_text = re_mod.sub(r'~~(.+?)~~', r'\1', script_text)
-        script_text = re_mod.sub(r'^#{1,6}\s*', '', script_text, flags=re_mod.MULTILINE)
-        script_text = re_mod.sub(r'^[\-\*\•]\s+', '', script_text, flags=re_mod.MULTILINE)
-        script_text = re_mod.sub(r'^\d+\.\s+', '', script_text, flags=re_mod.MULTILINE)
-        script_text = re_mod.sub(r'`([^`]+)`', r'\1', script_text)
-        script_text = re_mod.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', script_text)
-        script_text = re_mod.sub(r'\n{3,}', '\n\n', script_text)
-        
-        # === LOC SACH BREAK TAGS — Xoa toan bo the BREAK/break du AI co chen ===
-        script_text = re_mod.sub(r'<\s*BREAK[^>]*>', '', script_text, flags=re_mod.IGNORECASE)
-        script_text = re_mod.sub(r'\[\s*BREAK[^\]]*\]', '', script_text, flags=re_mod.IGNORECASE)
-        script_text = re_mod.sub(r'<\s*break\s+time[^>]*/?\s*>', '', script_text, flags=re_mod.IGNORECASE)
-        script_text = re_mod.sub(r'\s{2,}', ' ', script_text)
-        
-        script_text = script_text.strip()
-        
-        # Report the generated length, but never rewrite/truncate completed
-        # narration after Gemini has established a coherent story.
-        word_count = len(script_text.split())
-        print(f"[+] Kich ban sau xu ly: {word_count} tu (target={target_word_count}, max={max_word_count})", flush=True)
 
-        # The editor and parser share one stable representation: one timestamp
-        # block per row. This also repairs Gemini responses returned as one blob.
-        script_text = remove_non_story_timeline_rows(script_text)
+        issues_before = inspect_three_part_payload(pass1_payload)
+        final_payload = pass1_payload
+        repair_calls = 0
+        repair_fallback_used = False
 
-        # Don dep file tam va cac upload Gemini cua phien nay.
+        if issues_before:
+            update_prog(
+                78,
+                f"Dang tao clip cho {len(issue_scene_ids(pass1_payload, issues_before))} "
+                "canh can sua...",
+            )
+            try:
+                repair_ids = issue_scene_ids(pass1_payload, issues_before)
+                repair_scenes = scenes_by_ids(pass1_payload, repair_ids)
+                reel_events = []
+                for scene in repair_scenes:
+                    start, end, _ = extract_time_range(
+                        f"[TIME={scene['start']}-{scene['end']}] x"
+                    )
+                    if start is not None and end is not None and end > start:
+                        reel_events.append({
+                            "id": scene["scene_id"],
+                            "start": float(start),
+                            "end": float(end),
+                        })
+                repair_reel = build_timeline_verification_reel(
+                    video_path,
+                    reel_events,
+                    upload_staging_dir,
+                    ffmpeg_exe=ffmpeg_exe,
+                    max_workers=2,
+                    output_fps=3.0,
+                )
+                repair_upload_path = stage_gemini_upload(
+                    repair_reel, upload_staging_dir, "repair_scenes"
+                )
+                repair_file = upload_gemini_file_with_recovery(
+                    client_upload,
+                    repair_upload_path,
+                    label="clip sua canh",
+                    update_progress=lambda message: update_prog(82, message),
+                    max_attempts=5,
+                )
+                remote_files.append(repair_file)
+                wait_for_gemini_file(
+                    client,
+                    repair_file.name,
+                    max_wait_seconds=900,
+                    poll_interval=5,
+                    sleep_fn=time.sleep,
+                    on_wait=lambda waited, limit: update_prog(
+                        82, f"Gemini dang xu ly clip loi... ({waited}s/{limit}s)"
+                    ),
+                )
+                repair_uri = str(getattr(repair_file, "uri", "") or "").strip()
+                repair_mime = str(
+                    getattr(repair_file, "mime_type", "") or "video/mp4"
+                )
+                if repair_uri:
+                    repair_content = genai_types.Part.from_uri(
+                        file_uri=repair_uri,
+                        mime_type=repair_mime,
+                        media_resolution=(
+                            genai_types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW
+                        ),
+                    )
+                    repair_content.video_metadata = genai_types.VideoMetadata(fps=2.0)
+                else:
+                    repair_content = repair_file
+
+                best_payload = pass1_payload
+                best_issue_count = len(issues_before)
+                last_repair_error = None
+                for repair_attempt in range(2):
+                    update_prog(
+                        86,
+                        "Gemini dang sua dung cac scene_id bi loi"
+                        + (" (thu lai 1/1)..." if repair_attempt else "..."),
+                    )
+                    remaining_issues = inspect_three_part_payload(best_payload)
+                    retry_prompt = build_selective_repair_prompt(
+                        best_payload, remaining_issues
+                    )
+                    if repair_attempt and last_repair_error is not None:
+                        retry_prompt += (
+                            "\n\nLAN SUA TRUOC KHONG HOP LE: "
+                            + str(last_repair_error)
+                            + "\nChi tra JSON repairs/additions/drop_scene_ids."
+                        )
+                    try:
+                        repair_calls += 1
+                        repaired_text = generate_gemini_text_with_recovery(
+                            client,
+                            selected_model,
+                            [repair_content, retry_prompt],
+                            genai_types.GenerateContentConfig(temperature=0.2),
+                            "Gemini luot 2",
+                            update_progress=lambda message: update_prog(86, message),
+                            stream=True,
+                            max_attempts=3,
+                        )
+                        candidate = apply_selective_repairs(
+                            best_payload, repaired_text, repair_ids
+                        )
+                        candidate_issue_count = len(
+                            inspect_three_part_payload(candidate)
+                        )
+                        # A retry that does not strictly improve validation is
+                        # discarded so it cannot overwrite the better version.
+                        if candidate_issue_count < best_issue_count:
+                            best_payload = candidate
+                            best_issue_count = candidate_issue_count
+                        if candidate_issue_count == 0:
+                            break
+                        last_repair_error = ValueError(
+                            f"Con {candidate_issue_count} loi sau khi sua."
+                        )
+                    except Exception as exc:
+                        last_repair_error = exc
+                final_payload = best_payload
+                repair_fallback_used = best_payload is pass1_payload
+            except Exception as repair_error:
+                # Pass 2 is optional. A bad repair must never destroy the usable
+                # scene map and narration already produced by pass 1.
+                print(
+                    f"[!] Luot 2 that bai; giu ket qua luot 1: {repair_error}",
+                    flush=True,
+                )
+                repair_fallback_used = True
+
+        final_payload = clamp_payload_narrations(final_payload)
+        script_text = payload_to_timeline(final_payload)
+        script_text = normalize_simple_gemini_timeline(
+            script_text, video_duration_sec
+        )
+        word_count, event_count = measure_script_narration(script_text)
+
+        length_within_range = min_recap_words <= word_count <= max_recap_words
         update_prog(95, "Dang don dep...")
         cleanup_analysis_artifacts()
-
         with task_lock:
             TASKS[task_id]["status"] = "success"
             TASKS[task_id]["progress"] = 100
             TASKS[task_id]["message"] = "Tao kich ban thanh cong!"
             TASKS[task_id]["result"] = script_text
-            TASKS[task_id]["analysis_method"] = "locked-shot-id-storyboard"
-            TASKS[task_id]["generation_calls"] = generation_call_count
-            TASKS[task_id]["candidate_shots"] = len(candidate_shots)
+            TASKS[task_id]["analysis_method"] = "three-part-selective-repair"
+            TASKS[task_id]["generation_calls"] = pass1_calls + repair_calls
+            TASKS[task_id]["pass1_calls"] = pass1_calls
+            TASKS[task_id]["repair_calls"] = repair_calls
+            TASKS[task_id]["repair_fallback_used"] = repair_fallback_used
+            TASKS[task_id]["issues_before_repair"] = len(issues_before)
+            TASKS[task_id]["issues_after_repair"] = len(
+                inspect_three_part_payload(final_payload)
+            )
+            TASKS[task_id]["story_parts"] = final_payload["parts"]
+            TASKS[task_id]["characters"] = final_payload["characters"]
+            TASKS[task_id]["target_minutes"] = target_recap_minutes
+            TASKS[task_id]["target_words"] = target_recap_words
+            TASKS[task_id]["min_words"] = min_recap_words
+            TASKS[task_id]["max_words"] = max_recap_words
+            TASKS[task_id]["actual_words"] = word_count
+            TASKS[task_id]["actual_scenes"] = event_count
+            TASKS[task_id]["length_within_range"] = length_within_range
+            TASKS[task_id]["model_used"] = selected_model
+        return
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         cleanup_analysis_artifacts()
+        if is_daily_project_gemini_quota_error(e):
+            raise
+        traceback.print_exc()
         err_msg = str(e)
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
             user_msg = "Đã hết quota API miễn phí hôm nay! Quota sẽ tự động reset sau 24h. Vui lòng thử lại sau."
-        elif "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
+        elif is_gemini_auth_error(e):
             user_msg = "API Key không hợp lệ! Vui lòng kiểm tra lại key."
+        elif "WinError 10013" in err_msg or "forbidden by its access permissions" in err_msg:
+            user_msg = (
+                "Windows đang chặn kết nối HTTPS của tiến trình tool tới Gemini. "
+                "Hãy chạy tool ngoài sandbox và cho phép Python qua Firewall/VPN."
+            )
         else:
             user_msg = f"Lỗi: {err_msg[:300]}"
         with task_lock:
             TASKS[task_id]["status"] = "failed"
             TASKS[task_id]["message"] = user_msg
+
+
+def analyze_video_bg(
+    task_id, api_keys, model_name, video_filename, style, custom_prompt,
+    enable_multi_voice=False, review_minutes="auto",
+):
+    """Run analysis by API priority and rotate only on daily project quota."""
+    keys = [str(key or "").strip() for key in (api_keys or []) if str(key or "").strip()]
+    if not keys:
+        with task_lock:
+            TASKS[task_id]["status"] = "failed"
+            TASKS[task_id]["message"] = "Khong co API Key Gemini hop le."
+        return
+
+    exhausted = []
+    for index, api_key in enumerate(keys, start=1):
+        with task_lock:
+            TASKS[task_id]["active_api_priority"] = index
+            TASKS[task_id]["api_key_count"] = len(keys)
+            TASKS[task_id]["message"] = (
+                f"Dang dung Gemini API {index}/{len(keys)}..."
+            )
+        try:
+            _analyze_video_bg_once(
+                task_id,
+                api_key,
+                model_name,
+                video_filename,
+                style,
+                custom_prompt,
+                enable_multi_voice,
+                review_minutes,
+            )
+            return
+        except Exception as error:
+            if not is_daily_project_gemini_quota_error(error):
+                with task_lock:
+                    TASKS[task_id]["status"] = "failed"
+                    TASKS[task_id]["message"] = f"Loi: {str(error)[:300]}"
+                return
+            exhausted.append(index)
+            if index < len(keys):
+                with task_lock:
+                    TASKS[task_id]["progress"] = 5
+                    TASKS[task_id]["message"] = (
+                        f"API {index} da het quota ngay; dang khoi dong lai bang "
+                        f"API {index + 1}..."
+                    )
+
+    with task_lock:
+        TASKS[task_id]["status"] = "failed"
+        TASKS[task_id]["message"] = (
+            "Tat ca Gemini API da het quota ngay: "
+            + ", ".join(f"API {index}" for index in exhausted)
+            + ". Hay cho quota reset hoac thay API Key khac."
+        )
 
 def render_video_bg(task_id, input_video_name, bgm_name, bgm_volume, voice_name, voice_rate, sentences, options, export_mode):
     def update_prog(prog, msg):
@@ -1132,8 +1452,9 @@ def export_directory():
 def check_key():
     data = request.json or {}
     api_key = data.get("api_key", "").strip()
-    if not api_key:
-        return jsonify({"valid": False, "message": "API Key không được bỏ trống."})
+    key_error = validate_gemini_api_key(api_key)
+    if key_error:
+        return jsonify({"valid": False, "message": key_error}), 400
         
     try:
         client = genai.Client(api_key=api_key)
@@ -1143,48 +1464,34 @@ def check_key():
         available = []
         for m in models_list:
             name = m.name.replace("models/", "") if hasattr(m, 'name') else str(m)
-            if name in build_model_candidates(name, [name]):
+            if name in build_model_candidates(name, [m]):
                 available.append(name)
         return jsonify({"valid": True, "message": "Kết nối API Gemini thành công!", "models": available})
     except Exception as e:
         err_msg = str(e)
-        if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
+        if is_gemini_auth_error(e):
             return jsonify({"valid": False, "message": "API Key không hợp lệ! Kiểm tra lại tại https://aistudio.google.com/apikey"})
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
             return jsonify({"valid": True, "message": "API Key hợp lệ! Nhưng đã hết quota miễn phí hôm nay. Quota sẽ reset sau 24h.", "models": ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]})
+        if "WinError 10013" in err_msg or "forbidden by its access permissions" in err_msg:
+            return jsonify({
+                "valid": False,
+                "message": (
+                    "Windows đang chặn kết nối HTTPS tới Gemini. Hãy chạy tool ngoài sandbox "
+                    "và cho phép python.exe qua Firewall/VPN."
+                ),
+            })
         return jsonify({"valid": False, "message": f"Lỗi kết nối: {err_msg[:200]}"})
 
 @app.route("/api/list-videos", methods=["GET"])
 def list_videos():
-    files = os.listdir(WORKSPACE_DIR)
-    videos = [f for f in files if f.lower().endswith(('.mp4', '.mkv', '.avi', '.mov'))]
-    return jsonify(videos)
-
-@app.route("/api/debug-models", methods=["POST"])
-def debug_models():
-    data = request.json or {}
-    ak = data.get("api_key", "").strip()
-    if not ak:
-        return jsonify({"error": "No API key"})
     try:
-        client = genai.Client(api_key=ak)
-        results = []
-        for m in client.models.list():
-            results.append(m.name if hasattr(m, 'name') else str(m))
-        
-        test_models = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-        working = []
-        for tm in test_models:
-            try:
-                resp = client.models.generate_content(model=tm, contents=["Nói 'xin chào'."])
-                if resp and resp.text:
-                    working.append({"model": tm, "response": resp.text[:50]})
-            except Exception as e:
-                working.append({"model": tm, "error": str(e)[:100]})
-        
-        return jsonify({"all_models": results[:30], "test_results": working})
-    except Exception as e:
-        return jsonify({"error": str(e)[:300]})
+        return jsonify(normalize_existing_video_filenames(WORKSPACE_DIR))
+    except OSError as exc:
+        return jsonify({
+            "success": False,
+            "message": f"Khong the doi ten video sang ASCII: {exc}",
+        }), 500
 
 @app.route('/api/list-bgm', methods=['GET'])
 def list_bgm():
@@ -1212,43 +1519,84 @@ def upload_file():
         return jsonify({"success": False, "message": "Ten tep khong hop le."})
         
     if file:
-        filename = file.filename
+        original_filename = os.path.basename(file.filename.replace("\\", "/"))
+        filename = ascii_upload_filename(original_filename)
         ext = os.path.splitext(filename)[1].lower()
         
         # Kiem tra dinh dang file
         if file_type == "video":
             if ext not in ALLOWED_VIDEO_EXT:
                 return jsonify({"success": False, "message": f"Dinh dang {ext} khong ho tro. Chi chap nhan: {', '.join(ALLOWED_VIDEO_EXT)}"})
-            target_path = os.path.join(WORKSPACE_DIR, filename)
+            target_path = available_upload_path(WORKSPACE_DIR, filename)
         else:
             if ext not in ALLOWED_AUDIO_EXT:
                 return jsonify({"success": False, "message": f"Dinh dang {ext} khong ho tro. Chi chap nhan: {', '.join(ALLOWED_AUDIO_EXT)}"})
-            target_path = os.path.join(WORKSPACE_DIR, "static", "bgm", filename)
+            target_path = available_upload_path(
+                os.path.join(WORKSPACE_DIR, "static", "bgm"), filename
+            )
+
+        filename = os.path.basename(target_path)
             
         file.save(target_path)
-        return jsonify({"success": True, "filename": filename})
+        return jsonify({
+            "success": True,
+            "filename": filename,
+            "original_filename": original_filename,
+            "renamed": filename != original_filename,
+        })
         
     return jsonify({"success": False, "message": "Loi khong xac dinh khi luu file."})
 
 @app.route("/api/analyze-video", methods=["POST"])
 def analyze_video():
     data = request.json or {}
-    api_key = data.get("api_key", "").strip() or DEFAULT_API_KEY
+    raw_api_keys = data.get("api_keys", [])
+    if not isinstance(raw_api_keys, list):
+        raw_api_keys = []
+    legacy_key = str(data.get("api_key", "") or "").strip()
+    candidates = raw_api_keys if raw_api_keys else [legacy_key or DEFAULT_API_KEY]
+    api_keys = []
+    for slot_index, raw_key in enumerate(candidates[:3], start=1):
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if key in api_keys:
+            return jsonify({
+                "success": False,
+                "message": f"API {slot_index} bi trung voi API truoc do.",
+            }), 400
+        api_keys.append(key)
     model_name = data.get("model_name", "gemini-3.1-flash-lite")
-    video_filename = data.get("video_name", "")
+    video_filename = os.path.basename(
+        str(data.get("video_name", "")).replace("\\", "/")
+    )
     style = data.get("style", "dramatic")
     custom_prompt = data.get("custom_prompt", "").strip()
     enable_multi_voice = data.get("enable_multi_voice", False)
     project_id = str(data.get("project_id", "")).strip() or str(uuid.uuid4())
     review_minutes_raw = data.get("review_minutes", "auto")
     review_minutes = "auto" if str(review_minutes_raw).lower() == "auto" else max(3, min(20, int(review_minutes_raw)))
-    try:
-        analysis_passes = 3 if int(data.get("analysis_passes", 2) or 2) == 3 else 2
-    except (TypeError, ValueError):
-        analysis_passes = 2
+
+    if not api_keys:
+        return jsonify({"success": False, "message": "Chua nhap Gemini API Key."}), 400
+    for index, api_key in enumerate(api_keys, start=1):
+        key_error = validate_gemini_api_key(api_key)
+        if key_error:
+            return jsonify({
+                "success": False,
+                "message": f"API {index}: {key_error}",
+            }), 400
     
     if not video_filename:
         return jsonify({"success": False, "message": "Chưa chọn video gốc."})
+
+    try:
+        video_filename = normalize_video_file(WORKSPACE_DIR, video_filename)
+    except OSError as exc:
+        return jsonify({
+            "success": False,
+            "message": f"Khong the doi ten video sang ASCII: {exc}",
+        }), 500
         
     task_id = create_task(project_id, video_filename)
     with task_lock:
@@ -1262,8 +1610,8 @@ def analyze_video():
     thread = threading.Thread(
         target=analyze_video_bg,
         args=(
-            task_id, api_key, model_name, video_filename, style, custom_prompt,
-            enable_multi_voice, review_minutes, analysis_passes,
+            task_id, api_keys, model_name, video_filename, style, custom_prompt,
+            enable_multi_voice, review_minutes,
         )
     )
     thread.daemon = True
@@ -1274,11 +1622,28 @@ def analyze_video():
 @app.route("/api/split-sentences", methods=["POST"])
 def split_sentences():
     data = request.json or {}
-    text = data.get("text", "").strip()
+    raw_text = data.get("text", "")
+    text = (
+        "\n".join(str(item) for item in raw_text)
+        if isinstance(raw_text, list)
+        else str(raw_text or "")
+    ).strip()
     if not text:
         return jsonify([])
-        
-    sentences = split_text_into_sentences(text)
+
+    try:
+        sentences = split_text_into_sentences(text)
+    except Exception as exc:
+        # A completed Gemini script must remain editable even if an unusual
+        # token trips the richer TTS parser. Preserve each TIME row verbatim.
+        print(f"[!] Loi parser phan doan; dung fallback theo dong: {exc}", flush=True)
+        sentences = [
+            row.strip() for row in format_timeline_rows(text).splitlines()
+            if row.strip()
+        ]
+    sentences = [str(item).strip() for item in sentences if str(item).strip()]
+    if not sentences:
+        sentences = [text]
     return jsonify(sentences)
 
 @app.route("/api/preview-tts", methods=["POST"])
@@ -1320,9 +1685,22 @@ def render_video():
     voice_name = data.get("voice_name", "vi-VN-HoaiMyNeural")
     voice_rate = data.get("voice_rate", "-10%")
     sentences = data.get("sentences", [])
-    raw_timeline_text = (
-        "\n".join(str(item) for item in sentences)
-        if isinstance(sentences, list) else str(sentences or "")
+    raw_sentence_rows = (
+        [str(item) for item in sentences]
+        if isinstance(sentences, list) else [str(sentences or "")]
+    )
+
+    def is_timeline_control_row(row):
+        """VOICE/SFX rows control audio and must not count as visual ranges."""
+        _, _, body = extract_time_range(str(row or ""))
+        return bool(re.fullmatch(
+            r"\s*(?:<|\[)(?:VOICE|SFX)=[^>\]]+(?:>|\])\s*",
+            body,
+            flags=re.IGNORECASE,
+        ))
+
+    raw_timeline_text = "\n".join(
+        row for row in raw_sentence_rows if not is_timeline_control_row(row)
     )
     # Repair stale/browser timelines before persisting a render payload. Older
     # parsers collapsed timestamps beyond 99:59 into one oversized TTS item.

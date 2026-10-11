@@ -33,7 +33,9 @@ temp_*/
 .scene_cache/
 .tts_cache/
 .jobs/
+.analysis_checkpoints/
 _baseline*/
+.cleanup_quarantine_*/
 *.ass
 *.srt
 *.zip

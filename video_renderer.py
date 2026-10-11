@@ -5,14 +5,13 @@ import shutil
 import zipfile
 import pathlib
 import concurrent.futures
+import math
 from tts_engine import (
     create_srt,
     expand_visual_beats,
     generate_all_tts,
     get_audio_duration,
     parse_sentences_and_visual_beats,
-    parse_sentences_and_time_ranges,
-    split_text_into_sentences,
 )
 def get_ffmpeg_exe():
     try:
@@ -79,6 +78,20 @@ def _pause_duration_for_text(text):
     return 0.12
 
 
+def _quantize_durations_to_frames(durations, fps=30):
+    """Round cumulative boundaries, never each segment independently."""
+    fps = max(1, int(fps))
+    result = []
+    cumulative_seconds = 0.0
+    previous_frame = 0
+    for duration in durations:
+        cumulative_seconds += max(0.0, float(duration))
+        end_frame = max(previous_frame + 1, int(round(cumulative_seconds * fps)))
+        result.append((end_frame - previous_frame) / fps)
+        previous_frame = end_frame
+    return result
+
+
 def build_visual_edit_plan(
     durations,
     starts,
@@ -86,13 +99,16 @@ def build_visual_edit_plan(
     video_duration,
     min_playback_speed=0.90,
     fallback_starts=None,
+    scenes=None,
 ):
-    """Build an audio-led edit decision list for explicit Gemini ranges.
+    """Build a normal-speed edit list anchored to Gemini action starts.
 
-    Every narration item owns an independent source anchor. A long previous
-    sentence must never push the next item past its declared action. Explicit
-    ranges are hard visual locks: timing may slow the selected range, but may
-    never borrow frames from a neighbouring action.
+    Audio owns output duration. If it outlasts Gemini's initial range, keep the
+    locked START and extend END over real source footage. Never extend across a
+    later locked action start; only the unavoidable remainder may be held.
+
+    ``min_playback_speed`` is retained for call compatibility. This planner no
+    longer changes playback speed.
     """
     plan = []
     video_duration = max(0.0, float(video_duration))
@@ -109,26 +125,46 @@ def build_visual_edit_plan(
         if has_range:
             range_start = min(max(float(raw_start), 0.0), video_duration)
             range_end = min(max(float(raw_end), range_start), video_duration)
-            range_duration = range_end - range_start
-            if output_duration > range_duration:
-                # A locked ACTION range is authoritative. Never borrow frames
-                # from a neighbouring event merely to avoid slow motion; doing
-                # so was the main cause of cumulative semantic drift.
-                source_duration = range_duration
-            else:
-                source_duration = output_duration
             source_start = range_start
+            original_duration = max(0.05, range_end - range_start)
+
+            # A later narration item owns its START. Extending this shot across
+            # that boundary would show the next action under the current words
+            # and would also replay those frames in the following segment.
+            next_locked_start = video_duration
+            for later_index in range(index + 1, len(starts or [])):
+                later_start = starts[later_index]
+                if later_start is not None and float(later_start) > range_start:
+                    next_locked_start = min(video_duration, float(later_start))
+                    break
+            available_duration = max(0.05, next_locked_start - range_start)
+            source_duration = min(output_duration, available_duration)
+            visual_window_end = (
+                range_end
+                if output_duration <= original_duration
+                else min(next_locked_start, range_start + source_duration)
+            )
         else:
             source_start = min(max(float(raw_start or 0.0), 0.0), video_duration)
             source_duration = output_duration
+            original_duration = source_duration
+            visual_window_end = source_start + source_duration
 
         source_duration = min(source_duration, video_duration) if video_duration else 0.0
-        # Close to the physical end there is no footage to extend into. Shift
-        # backwards so the output still consists entirely of real frames.
+        # START is authoritative. At source EOF, keep it fixed and accept a
+        # small held remainder rather than silently showing earlier footage.
         if video_duration and source_start + source_duration > video_duration:
-            source_start = max(0.0, video_duration - source_duration)
+            source_duration = max(0.0, video_duration - source_start)
 
-        playback_speed = source_duration / output_duration if output_duration else 1.0
+        playback_speed = 1.0
+        source_end = visual_window_end
+        shot_count = 1
+        if scenes and source_duration > 0:
+            shot_count = max(1, sum(
+                1 for scene in scenes
+                if float(scene.get("end", 0.0)) > source_start + 0.01
+                and float(scene.get("start", 0.0)) < source_end - 0.01
+            ))
         plan.append({
             "index": index,
             "source_start": source_start,
@@ -136,19 +172,98 @@ def build_visual_edit_plan(
             "output_duration": output_duration,
             "playback_speed": playback_speed,
             "has_range": has_range,
+            "hold_duration": max(0.0, output_duration - source_duration),
+            "original_source_duration": original_duration,
+            "extended_by": max(0.0, source_duration - original_duration),
+            "shot_count": shot_count,
+            "visual_window_end": visual_window_end,
         })
 
-    # Do not let one long spoken beat consume frames owned by the next action;
-    # otherwise the next segment starts earlier and visibly replays footage.
-    for index in range(len(plan) - 1):
-        next_start = starts[index + 1] if starts and index + 1 < len(starts) else None
-        if next_start is None:
-            continue
-        available = float(next_start) - float(plan[index]["source_start"])
-        if available > 0.05 and plan[index]["source_duration"] > available:
-            plan[index]["source_duration"] = available
-            plan[index]["playback_speed"] = available / plan[index]["output_duration"]
     return plan
+
+
+def build_shot_spans(edit, scenes, min_shot_seconds=1.5, max_shot_seconds=3.0):
+    """Select ordered source shots across one locked Gemini visual window."""
+    target = max(0.0, float(edit.get("source_duration", 0.0)))
+    window_start = max(0.0, float(edit.get("source_start", 0.0)))
+    window_end = max(window_start, float(edit.get("visual_window_end", window_start + target)))
+    if target <= 0.01 or not scenes:
+        return [(window_start, target)] if target > 0.0 else []
+
+    candidates = []
+    for scene in scenes:
+        start = max(window_start, float(scene.get("start", 0.0)))
+        end = min(window_end, float(scene.get("end", 0.0)))
+        if end - start >= 0.08:
+            candidates.append((start, end))
+    if not candidates:
+        return [(window_start, min(target, window_end - window_start))]
+
+    max_shot_seconds = max(0.25, float(max_shot_seconds))
+    min_shot_seconds = min(max_shot_seconds, max(0.08, float(min_shot_seconds)))
+    desired = min(len(candidates), max(1, int(math.ceil(target / max_shot_seconds))))
+    if desired == 1:
+        selected_indexes = [0]
+    else:
+        selected_indexes = sorted(set(
+            int(round(position * (len(candidates) - 1) / float(desired - 1)))
+            for position in range(desired)
+        ))
+
+    selected = set(selected_indexes)
+    while sum(candidates[index][1] - candidates[index][0] for index in selected) + 0.001 < target:
+        remaining = [index for index in range(len(candidates)) if index not in selected]
+        if not remaining:
+            break
+        selected.add(max(remaining, key=lambda index: candidates[index][1] - candidates[index][0]))
+    selected_indexes = sorted(selected)
+    selected_ranges = [candidates[index] for index in selected_indexes]
+    capacities = [end - start for start, end in selected_ranges]
+
+    allocations = [min(capacity, min_shot_seconds) for capacity in capacities]
+    allocated = sum(allocations)
+    if allocated > target:
+        scale = target / max(allocated, 0.001)
+        allocations = [value * scale for value in allocations]
+        allocated = target
+
+    for soft_limit in (max_shot_seconds, None):
+        remaining_target = target - allocated
+        if remaining_target <= 0.001:
+            break
+        room = [
+            max(0.0, min(capacity, soft_limit) - value) if soft_limit is not None
+            else max(0.0, capacity - value)
+            for capacity, value in zip(capacities, allocations)
+        ]
+        total_room = sum(room)
+        if total_room <= 0.001:
+            continue
+        addition = min(remaining_target, total_room)
+        for index, available in enumerate(room):
+            allocations[index] += addition * available / total_room
+        allocated += addition
+
+    spans = []
+    for position, ((start, end), duration) in enumerate(zip(selected_ranges, allocations)):
+        duration = min(max(0.0, duration), end - start)
+        if duration <= 0.01:
+            continue
+        if position == 0:
+            clip_start = start
+        elif position == len(selected_ranges) - 1:
+            clip_start = end - duration
+        else:
+            clip_start = start + ((end - start) - duration) / 2.0
+        spans.append((clip_start, duration))
+
+    shortfall = target - sum(duration for _, duration in spans)
+    if spans and shortfall > 0.001:
+        last_start, last_duration = spans[-1]
+        last_end = selected_ranges[-1][1]
+        extra = min(shortfall, max(0.0, last_end - (last_start + last_duration)))
+        spans[-1] = (last_start, last_duration + extra)
+    return spans
 
 
 def trim_silence_from_audio(input_path, output_path, pause_duration=0.15):
@@ -182,9 +297,11 @@ def create_master_audio(audio_paths, bgm_path, bgm_volume, output_path, temp_dir
         if os.path.exists(master_tts_path):
             print("[+] Su dung master TTS truc tiep (giong doc lien mach).")
             tts_master_wav = os.path.join(temp_dir, "master_tts.wav")
-            # Convert MP3 to WAV cho chat luong tot nhat
+            # Do not post-trim this master: changing its internal duration after
+            # cue extraction would make later event visuals drift from speech.
             subprocess.run([
-                ffmpeg_exe, "-y", "-i", master_tts_path, "-c:a", "pcm_s16le", tts_master_wav
+                ffmpeg_exe, "-y", "-i", master_tts_path,
+                "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1", tts_master_wav
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             
             if bgm_path and os.path.exists(bgm_path):
@@ -252,73 +369,8 @@ def create_master_audio(audio_paths, bgm_path, bgm_volume, output_path, temp_dir
         shutil.copy2(tts_master_path, output_path)
     
     return trimmed_durations
-def _step1_prefilter_video(input_video_path, filtered_path, options, w_vid, h_vid):
-    """Buoc 1: Ap dung bo loc hinh anh (hflip, crop, zoom, contrast) cho TOAN BO video chi 1 lan."""
-    ffmpeg_exe = get_ffmpeg_exe()
-    
-    mirror = options.get("mirror", True)
-    zoom_factor = float(options.get("zoom_factor", 1.08))
-    contrast = float(options.get("contrast", 1.05))
-    
-    enable_zoom_crop = options.get("enable_zoom_crop", True)
-    enable_ken_burns = options.get("enable_ken_burns", False)
-    
-    vf_parts = []
-    
-    # Neu enable_zoom_crop = True -> thuc hien cat bo watermark 10% (5% moi canh)
-    if enable_zoom_crop:
-        vf_parts.append("crop=in_w*0.9:in_h*0.9:in_w*0.05:in_h*0.05")
-        
-    if mirror:
-        vf_parts.append("hflip")
-        
-    if enable_ken_burns:
-        print("[INFO] Đã bật chế độ Khung hình Biết thở (Dynamic Ken Burns).")
-        # Sử dụng biểu thức toán học thời gian t trong lệnh crop để tối ưu hóa CPU/GPU thay vì zoompan
-        # Zoom mượt mà từ 1.0 lên 1.15 dựa trên thời gian (t)
-        vf_parts.append("crop='iw/min(1.0+0.015*t,1.15)':'ih/min(1.0+0.015*t,1.15)':'(iw-iw/min(1.0+0.015*t,1.15))/2':'(ih-ih/min(1.0+0.015*t,1.15))/2'")
-    elif enable_zoom_crop and zoom_factor != 1.0:
-        print("[INFO] Chế độ Khung hình Biết thở đang TẮT (Render tốc độ cao).")
-        # Zoom-in chi duoc thuc hien neu co zoom_factor va dc phep crop
-        vf_parts.append(f"crop=in_w/{zoom_factor}:in_h/{zoom_factor}:(in_w-in_w/{zoom_factor})/2:(in_h-in_h/{zoom_factor})/2")
-    
-    # Khuon hinh tro ve do phan giai cua video goc, truoc khi vao buoc 2 cat ty le chuan (chỉ scale nếu đã crop/zoom)
-    if enable_zoom_crop:
-        vf_parts.append(f"scale={w_vid}:{h_vid}")
-    
-    if contrast != 1.0:
-        vf_parts.append(f"eq=contrast={contrast}")
-    
-    vf_str = ",".join(vf_parts) if vf_parts else "copy"
-    
-    # Force keyframes every 1s for frame-accurate cuts later
-    # NVENC (GPU - nhanh nhat) + Chat luong cao 12M va lanczos scaler
-    cmd = [
-        ffmpeg_exe, "-y", "-hwaccel", "auto",
-        "-i", input_video_path,
-        "-vf", vf_str,
-        "-sws_flags", "lanczos",
-        "-an",
-        "-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "12M",
-        "-force_key_frames", "expr:gte(t,n_forced*1)",
-        filtered_path
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if res.returncode != 0:
-        # Fallback CPU
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-i", input_video_path,
-            "-vf", vf_str,
-            "-sws_flags", "lanczos",
-            "-an",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-force_key_frames", "expr:gte(t,n_forced*1)",
-            filtered_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_video, speed_factor, timestamps=None, end_timestamps=None, scenes=None, assigned_scenes=None, options=None, audio_paths=None, diagnostic_log=None):
+def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_video, timestamps=None, end_timestamps=None, scenes=None, assigned_scenes=None, options=None, diagnostic_log=None):
     """
     Buoc 2: Cat tung phan canh.
     
@@ -340,16 +392,16 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         scenes is not None and assigned_scenes is not None and
         len(assigned_scenes) == N and len(scenes) > 0
     )
-    use_ranges = bool(
+    use_ranges = not use_smart and bool(
         timestamps and end_timestamps
         and len(timestamps) == N and len(end_timestamps) == N
         and any(start is not None and end is not None for start, end in zip(timestamps, end_timestamps))
     )
     
-    if use_ranges:
+    if use_smart:
+        print(f"[+] Step2: Tim shot theo nac mo rong 3-5-10s")
+    elif use_ranges:
         print(f"[+] Step2: Su dung truc tiep timeline START-END cua Gemini")
-    elif use_smart:
-        print(f"[+] Step2: Su dung Adaptive Scene Matching 15-30-60s")
     else:
         print(f"[+] Step2: Su dung Linear Interpolation (fallback)")
     
@@ -500,18 +552,62 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         target_w, target_h = (1280, 720) if use_720p else (1920, 1080)
     
     ranged_plan = None
+    frame_durations = _quantize_durations_to_frames(durations, fps=30)
     if use_ranges:
         fallback_starts = [get_video_position_for_sentence(index) for index in range(N)]
         ranged_plan = build_visual_edit_plan(
-            durations,
+            frame_durations,
             timestamps,
             end_timestamps,
             D_video,
             fallback_starts=fallback_starts,
+            scenes=scenes,
         )
+        for edit in ranged_plan:
+            edit["shot_spans"] = build_shot_spans(edit, scenes)
+        extended = []
+        capped = []
+        for index, edit in enumerate(ranged_plan):
+            extension = float(edit.get("extended_by", 0.0))
+            hold = float(edit.get("hold_duration", 0.0))
+            if extension > 0.04:
+                extended.append((index + 1, extension))
+            if hold > 0.04:
+                capped.append((index + 1, hold))
+        if extended:
+            total_extension = sum(value for _, value in extended)
+            message = (
+                f"Da keo TIME_END cua {len(extended)}/{N} canh them tong "
+                f"{total_extension:.2f}s de khop audio, giu toc do video goc."
+            )
+            print(f"[+] {message}", flush=True)
+            if diagnostic_log:
+                details = ", ".join(f"cau {index}: +{value:.2f}s" for index, value in extended)
+                diagnostic_log("INFO", message, details)
+        if capped:
+            total_hold = sum(value for _, value in capped)
+            message = (
+                f"{len(capped)}/{N} canh khong the keo them vi cham moc canh sau/het video "
+                f"(con thieu {total_hold:.2f}s); chi giu khung cuoi cho phan bat buoc."
+            )
+            print(f"[!] {message}", flush=True)
+            if diagnostic_log:
+                details = ", ".join(f"cau {index}: {value:.2f}s" for index, value in capped)
+                diagnostic_log("WARNING", message, details)
+        if scenes:
+            shot_counts = [max(1, len(edit.get("shot_spans", []))) for edit in ranged_plan]
+            multi_shot = sum(1 for count in shot_counts if count > 1)
+            total_shots = sum(shot_counts)
+            message = (
+                f"Ban do diem cat: {total_shots} shot tu nhien cho {N} cau; "
+                f"{multi_shot}/{N} cau co nhieu goc quay."
+            )
+            print(f"[+] {message}", flush=True)
+            if diagnostic_log:
+                diagnostic_log("INFO", message)
 
     for i in range(N):
-        d_i = durations[i]
+        d_i = frame_durations[i]
 
         if ranged_plan:
             edit = ranged_plan[i]
@@ -557,8 +653,6 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         prev_video_end = min(D_video, S_i + source_duration)
         prev_scene_idx = current_scene_idx
         
-        seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
-        
         scale_vf = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1"
         
         if enable_ken_burns:
@@ -570,15 +664,24 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
         else:
             combined_vf = scale_vf
 
-        segment_jobs.append((i, S_i, source_duration, output_duration, combined_vf, seg_path))
+        if ranged_plan:
+            shot_spans = list(edit.get("shot_spans") or [(S_i, source_duration)])
+        else:
+            shot_spans = [(S_i, source_duration)]
+        real_duration = sum(duration for _, duration in shot_spans)
+        seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+        segment_jobs.append((
+            i, shot_spans[0][0], real_duration, output_duration,
+            combined_vf, seg_path, shot_spans,
+        ))
 
     # Merge consecutive narration items only when their selected source ranges
     # are truly continuous. Audio/subtitle timing remains the sum of durations.
     grouped_jobs = []
     for job in segment_jobs:
-        index, start, source_duration, output_duration, video_filter, path = job
+        index, start, source_duration, output_duration, video_filter, path, shot_spans = job
         if grouped_jobs and not ranged_plan:
-            prev_index, prev_start, prev_source_duration, prev_output_duration, prev_filter, prev_path = grouped_jobs[-1]
+            prev_index, prev_start, prev_source_duration, prev_output_duration, prev_filter, prev_path, _prev_spans = grouped_jobs[-1]
             source_gap = abs(start - (prev_start + prev_source_duration))
             # Only merge truly contiguous source playback. A larger tolerance
             # silently includes frames between two distinct action ranges.
@@ -594,6 +697,7 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
                     prev_output_duration + output_duration,
                     prev_filter,
                     prev_path,
+                    [(prev_start, prev_source_duration + source_duration)],
                 )
                 continue
         grouped_jobs.append(job)
@@ -602,26 +706,52 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
     segment_jobs = grouped_jobs
 
     def render_segment(job):
-        index, start, source_duration, output_duration, video_filter, path = job
-        # Give the fps/trim filters two extra source frames. Reading exactly to
-        # the requested boundary makes FFmpeg omit the final output frame.
-        read_duration = min(max(0.0, D_video - start), source_duration + 2.0 / 30.0)
-        timing_ratio = output_duration / max(source_duration, 0.001)
-        timing_filter = (
-            f"trim=duration={source_duration:.6f},"
-            f"setpts={timing_ratio:.9f}*(PTS-STARTPTS),fps=30,"
-            # FFmpeg represents duration by the timestamp after the last frame.
-            # One bounded CFR guard frame prevents a 1/30s audio cut at EOF;
-            # unlike the removed 3600s tpad, this can never create a visible hold.
-            "tpad=stop_mode=clone:stop_duration=0.034,"
-            f"trim=duration={output_duration:.6f},setpts=PTS-STARTPTS"
-        )
-        full_filter = f"{video_filter},{timing_filter}"
-        common = [
-            ffmpeg_exe, "-y", "-ss", f"{start:.3f}", "-t", f"{read_duration:.3f}",
-            "-i", input_video_path, "-map", "0:v:0", "-an",
-            "-vf", full_filter, "-r", "30", "-pix_fmt", "yuv420p",
-        ]
+        index, start, source_duration, output_duration, video_filter, path, shot_spans = job
+        hold_duration = max(0.0, output_duration - source_duration)
+        if len(shot_spans) > 1:
+            inputs = []
+            filters = []
+            labels = []
+            for part_index, (part_start, part_duration) in enumerate(shot_spans):
+                read_duration = min(
+                    max(0.0, D_video - part_start),
+                    part_duration + 2.0 / 30.0,
+                )
+                inputs.extend([
+                    "-ss", f"{part_start:.3f}", "-t", f"{read_duration:.3f}",
+                    "-i", input_video_path,
+                ])
+                label = f"v{part_index}"
+                filters.append(
+                    f"[{part_index}:v]{video_filter},"
+                    f"trim=duration={part_duration:.6f},"
+                    f"setpts=PTS-STARTPTS,fps=30[{label}]"
+                )
+                labels.append(f"[{label}]")
+            filters.append(
+                "".join(labels)
+                + f"concat=n={len(labels)}:v=1:a=0,"
+                + f"tpad=stop_mode=clone:stop_duration={hold_duration + 0.034:.6f},"
+                + f"trim=duration={output_duration:.6f},setpts=PTS-STARTPTS[vout]"
+            )
+            common = [ffmpeg_exe, "-y"] + inputs + [
+                "-filter_complex", ";".join(filters),
+                "-map", "[vout]", "-an", "-r", "30", "-pix_fmt", "yuv420p",
+            ]
+        else:
+            read_duration = min(max(0.0, D_video - start), source_duration + 2.0 / 30.0)
+            timing_filter = (
+                f"trim=duration={source_duration:.6f},"
+                "setpts=PTS-STARTPTS,fps=30,"
+                f"tpad=stop_mode=clone:stop_duration={hold_duration + 0.034:.6f},"
+                f"trim=duration={output_duration:.6f},setpts=PTS-STARTPTS"
+            )
+            full_filter = f"{video_filter},{timing_filter}"
+            common = [
+                ffmpeg_exe, "-y", "-ss", f"{start:.3f}", "-t", f"{read_duration:.3f}",
+                "-i", input_video_path, "-map", "0:v:0", "-an",
+                "-vf", full_filter, "-r", "30", "-pix_fmt", "yuv420p",
+            ]
         nvenc = common + [
             "-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "10M", path,
         ]
@@ -647,7 +777,7 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
     return segment_paths
 
 def _step3_concat_segments(segment_paths, output_path, temp_dir, diagnostic_log=None):
-    """Buoc 3: Noi tat ca phan canh (concat demuxer)."""
+    """Join segments on one regenerated CFR timeline."""
     ffmpeg_exe = get_ffmpeg_exe()
     
     concat_file = os.path.join(temp_dir, "video_concat.txt")
@@ -656,32 +786,69 @@ def _step3_concat_segments(segment_paths, output_path, temp_dir, diagnostic_log=
             safe = sp.replace("\\", "/")
             f.write(f"file '{safe}'\n")
     
-    cmd = [
+    common = [
         ffmpeg_exe, "-y",
         "-f", "concat", "-safe", "0",
         "-i", concat_file,
-        "-c", "copy",
-        output_path
+        "-map", "0:v:0", "-an",
+        "-vf", "fps=30,setpts=N/(30*TB)",
+        "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     ]
+    cmd = common + ["-c:v", "h264_nvenc", "-preset", "p1", "-b:v", "10M", output_path]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+    if result.returncode != 0:
+        cmd = common + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", output_path]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
     if result.returncode != 0:
         if diagnostic_log:
             diagnostic_log("ERROR", f"FFmpeg noi video that bai (code {result.returncode}).", (result.stderr or "")[-12000:])
         raise RuntimeError(f"FFmpeg noi video that bai; exit code {result.returncode}. Chi tiet trong task log.")
 
-def create_master_video_raw(input_video_path, output_path, sentences, durations, options, update_fn=None, timestamps=None, end_timestamps=None, audio_paths=None, diagnostic_log=None):
+def create_master_video_raw(input_video_path, output_path, sentences, durations, options, update_fn=None, timestamps=None, end_timestamps=None, diagnostic_log=None):
     """Pipeline: Gemini time ranges -> cut continuous source segments -> concat."""
     D_video, w_vid, h_vid = get_video_info(input_video_path)
-    speed_factor = float(options.get("speed_factor", 1.0))
     temp_dir = os.path.dirname(output_path)
     render_options = dict(options)
     render_options["_source_width"] = w_vid
     render_options["_source_height"] = h_vid
     
-    # Gemini START-END ranges are authoritative. Semantic scene search used to
-    # override correct anchors on cartoons, so it is intentionally bypassed.
     scenes = None
     assigned_scenes = None
+    complete_locked_timeline = bool(
+        timestamps and end_timestamps
+        and len(timestamps) == len(sentences)
+        and len(end_timestamps) == len(sentences)
+        and all(
+            start is not None and end is not None and float(end) > float(start)
+            for start, end in zip(timestamps, end_timestamps)
+        )
+    )
+
+    # A complete verified START-END timeline is authoritative. Semantic scene
+    # matching is only a recovery path for incomplete timelines; allowing it to
+    # replace every valid anchor can select a nearby but incorrect action and
+    # makes later scenes drift as narration overruns accumulate.
+    if timestamps and end_timestamps and not complete_locked_timeline:
+        try:
+            from scene_matcher import smart_scene_selection
+            scenes, assigned_scenes = smart_scene_selection(
+                input_video_path, sentences, timestamps, durations, temp_dir,
+                update_fn=update_fn, video_duration=D_video,
+                end_timestamps=end_timestamps,
+            )
+        except Exception as scene_error:
+            print(f"[!] Tim canh lan can that bai; giu range Gemini: {scene_error}", flush=True)
+            scenes, assigned_scenes = None, None
+    elif complete_locked_timeline:
+        print(f"[+] Timeline khoa day du: dung truc tiep {len(sentences)} range START-END.", flush=True)
+        try:
+            if update_fn:
+                update_fn(55, "Dang lap ban do diem cat mot lan cho toan video...")
+            from scene_matcher import load_or_detect_scenes
+            scenes = load_or_detect_scenes(input_video_path)
+        except Exception as scene_error:
+            print(f"[!] Khong lap duoc ban do diem cat; giu range Gemini: {scene_error}", flush=True)
+            scenes = None
     
     # Buoc 1: Gộp bộ lọc (Combined Filtergraph) - Tiết kiệm I/O
     if update_fn:
@@ -692,8 +859,8 @@ def create_master_video_raw(input_video_path, output_path, sentences, durations,
         mode = "Gemini START-END" if timestamps and end_timestamps else "Linear"
         update_fn(70, f"Buoc 2/3: Dang cat {len(sentences)} phan canh ({mode})...")
     segment_paths = _step2_cut_segments(
-        input_video_path, temp_dir, sentences, durations, D_video, speed_factor, 
-        timestamps, end_timestamps, scenes, assigned_scenes, render_options, None, diagnostic_log
+        input_video_path, temp_dir, sentences, durations, D_video,
+        timestamps, end_timestamps, scenes, assigned_scenes, render_options, diagnostic_log
     )
     
     # Buoc 3: Noi cac phan canh
@@ -835,7 +1002,7 @@ def export_capcut_package(task_id, input_video_path, bgm_path, bgm_volume, voice
         visual_sentences, visual_durations, visual_starts, visual_ends = expand_visual_beats(
             clean_sentences, durations, visual_groups, word_cues
         )
-        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, audio_paths=None, diagnostic_log=diagnostic_log)
+        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, diagnostic_log=diagnostic_log)
         
         # 5. Zip it up
         update_status_fn(90, "Đang đóng gói ZIP cho CapCut...")
@@ -911,7 +1078,7 @@ def render_review_video_ffmpeg(task_id, input_video_path, bgm_path, bgm_volume, 
                 "INFO",
                 f"Audio-led visual beats: {len(clean_sentences)} cau noi -> {len(visual_sentences)} canh hanh dong.",
             )
-        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, audio_paths=None, diagnostic_log=diagnostic_log)
+        create_master_video_raw(input_video_path, master_video_path, visual_sentences, visual_durations, options, update_fn=update_status_fn, timestamps=visual_starts, end_timestamps=visual_ends, diagnostic_log=diagnostic_log)
         
         update_status_fn(80, "Dang nung phu de vao video (Hardsub)...")
         output_filename = f"video_review_{task_id}.mp4"

@@ -3,6 +3,8 @@
 // =====================================================================
 const state = {
     apiKey: '',
+    apiKeys: [],
+    apiVerified: false,
     selectedVideo: '',
     selectedBgm: '',
     bgmVolume: 12,
@@ -29,7 +31,14 @@ const dom = {
     
     // Step 1
     apiKeyInput: document.getElementById('api-key-input'),
+    apiKeyInput2: document.getElementById('api-key-input-2'),
+    apiKeyInput3: document.getElementById('api-key-input-3'),
     btnToggleApiKey: document.getElementById('btn-toggle-api-key'),
+    btnExpandApiKeys: document.getElementById('btn-expand-api-keys'),
+    additionalApiKeys: document.getElementById('additional-api-keys'),
+    apiKeysInlineError: document.getElementById('api-keys-inline-error'),
+    apiKeysGroup: document.getElementById('api-keys-group'),
+    apiPriorityButtons: document.querySelectorAll('.btn-api-priority'),
     modelSelect: document.getElementById('model-select'),
     btnVerifyApi: document.getElementById('btn-verify-api'),
     apiStatusBadge: document.getElementById('api-status-badge'),
@@ -192,6 +201,7 @@ async function chooseExportDirectory() {
 }
 
 function updateAPIIndicator(isValid, message) {
+    state.apiVerified = Boolean(isValid);
     const indicator = dom.apiStatusBadge.querySelector('.indicator');
     const statusText = dom.apiStatusBadge.querySelector('.status-text');
     
@@ -270,13 +280,117 @@ function enableStep(stepNum) {
 // =====================================================================
 // INITIAL LOADING & API TASKS
 // =====================================================================
+function apiKeySlotInputs() {
+    return [dom.apiKeyInput, dom.apiKeyInput2, dom.apiKeyInput3];
+}
+
+function setApiKeySlotValues(keys) {
+    const padded = [...keys.slice(0, 3), '', '', ''].slice(0, 3);
+    apiKeySlotInputs().forEach((input, index) => {
+        if (input) input.value = padded[index];
+    });
+}
+
+function validateApiKeySlots() {
+    const inputs = apiKeySlotInputs();
+    const values = inputs.map(input => input ? input.value.trim() : '');
+    inputs.forEach(input => input && input.classList.remove('api-key-duplicate'));
+
+    let error = '';
+    if (!values[0] && (values[1] || values[2])) {
+        error = 'API 1 không được để trống khi có API dự phòng.';
+    } else if (!values[1] && values[2]) {
+        error = 'Hãy nhập API 2 trước khi dùng API 3.';
+    }
+
+    const firstIndexByKey = new Map();
+    values.forEach((key, index) => {
+        if (!key) return;
+        if (firstIndexByKey.has(key)) {
+            const firstIndex = firstIndexByKey.get(key);
+            inputs[firstIndex].classList.add('api-key-duplicate');
+            inputs[index].classList.add('api-key-duplicate');
+            if (!error) error = `API ${index + 1} bị trùng với API ${firstIndex + 1}.`;
+        } else {
+            firstIndexByKey.set(key, index);
+        }
+    });
+
+    if (dom.apiKeysInlineError) {
+        dom.apiKeysInlineError.textContent = error;
+        dom.apiKeysInlineError.classList.toggle('hidden', !error);
+    }
+    return { valid: !error, keys: values.filter(Boolean), error };
+}
+
+function collectApiKeys() {
+    const result = validateApiKeySlots();
+    if (!result.valid) return null;
+    return result.keys;
+}
+
+function persistOrderedApiKeys(keys) {
+    localStorage.setItem('gemini_api_keys', JSON.stringify(keys));
+    if (keys[0]) localStorage.setItem('gemini_api_key', keys[0]);
+    else localStorage.removeItem('gemini_api_key');
+}
+
+function prioritizeApiSlot(slotIndex) {
+    const validation = validateApiKeySlots();
+    if (!validation.valid) {
+        showToast(validation.error, 'error');
+        return;
+    }
+    const values = apiKeySlotInputs().map(input => input ? input.value.trim() : '');
+    const selected = values[slotIndex];
+    if (!selected) {
+        showToast(`API ${slotIndex + 1} đang trống.`, 'error');
+        return;
+    }
+    if (slotIndex === 0) {
+        showToast('API 1 đã là ưu tiên cao nhất.', 'success');
+        return;
+    }
+
+    const oldPrimary = values[0];
+    const middle = values
+        .slice(1)
+        .filter((key, offset) => offset + 1 !== slotIndex && key);
+    const ordered = [selected, ...middle];
+    if (oldPrimary && oldPrimary !== selected) ordered.push(oldPrimary);
+    setApiKeySlotValues(ordered);
+    state.apiKeys = ordered;
+    state.apiKey = ordered[0];
+    if (state.apiVerified) persistOrderedApiKeys(ordered);
+    validateApiKeySlots();
+    setAdditionalApiKeysExpanded(ordered.length > 1);
+    showToast(`Đã đặt API ${slotIndex + 1} lên ưu tiên số 1.`, 'success');
+}
+
+function setAdditionalApiKeysExpanded(expanded) {
+    if (!dom.additionalApiKeys || !dom.btnExpandApiKeys) return;
+    dom.additionalApiKeys.classList.toggle('hidden', !expanded);
+    if (dom.apiKeysGroup) dom.apiKeysGroup.classList.toggle('api-keys-expanded', expanded);
+    dom.btnExpandApiKeys.classList.toggle('expanded', expanded);
+    dom.btnExpandApiKeys.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+}
+
 async function loadInitialData() {
     // Load API key tu localStorage neu co
-    const savedKey = localStorage.getItem('gemini_api_key');
-    if (savedKey) {
-        dom.apiKeyInput.value = savedKey;
+    let savedKeys = [];
+    try {
+        const parsed = JSON.parse(localStorage.getItem('gemini_api_keys') || '[]');
+        if (Array.isArray(parsed)) savedKeys = parsed.slice(0, 3);
+    } catch (_) {}
+    if (!savedKeys.length) {
+        const savedKey = localStorage.getItem('gemini_api_key');
+        if (savedKey) savedKeys = [savedKey];
     }
-    state.apiKey = dom.apiKeyInput.value;
+    [dom.apiKeyInput, dom.apiKeyInput2, dom.apiKeyInput3].forEach((input, index) => {
+        if (input && savedKeys[index]) input.value = savedKeys[index];
+    });
+    state.apiKeys = collectApiKeys() || [];
+    state.apiKey = state.apiKeys[0] || '';
     
     // Tai danh sach video va nhac nen co san
     await loadVideosList();
@@ -289,40 +403,55 @@ async function loadInitialData() {
 }
 
 async function verifyApiKey(showSuccessToast = true) {
-    state.apiKey = dom.apiKeyInput.value.trim();
-    if (!state.apiKey) {
-        showToast('Vui lòng nhập API Key!', 'error');
-        return;
+    const apiKeys = collectApiKeys();
+    if (apiKeys === null) {
+        showToast(dom.apiKeysInlineError.textContent || 'Danh sách API không hợp lệ.', 'error');
+        return false;
     }
+    if (!apiKeys.length) {
+        showToast('Vui lòng nhập API Key!', 'error');
+        return false;
+    }
+    state.apiKeys = apiKeys;
+    state.apiKey = apiKeys[0];
     
     dom.btnVerifyApi.disabled = true;
     dom.btnVerifyApi.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang xác thực...';
     
     try {
-        const res = await fetch('/api/check-key', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ api_key: state.apiKey })
-        });
-        const data = await res.json();
-        
-        if (data.valid) {
+        let primaryData = null;
+        for (let index = 0; index < apiKeys.length; index++) {
+            dom.btnVerifyApi.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Xác thực API ${index + 1}/${apiKeys.length}...`;
+            const res = await fetch('/api/check-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: apiKeys[index] })
+            });
+            const data = await res.json();
+            if (!data.valid) {
+                updateAPIIndicator(false);
+                showToast(`API ${index + 1}: ${data.message}`, 'error');
+                return false;
+            }
+            if (index === 0) primaryData = data;
+        }
+
+        if (primaryData) {
             updateAPIIndicator(true);
-            // Luu API key vao localStorage
-            localStorage.setItem('gemini_api_key', state.apiKey);
+            persistOrderedApiKeys(apiKeys);
             if (showSuccessToast) {
-                showToast('Kết nối API Gemini thành công! Key đã được ghi nhớ.', 'success');
+                showToast(`Đã xác thực ${apiKeys.length} Gemini API theo thứ tự ưu tiên.`, 'success');
             }
             
             // Auto-populate model dropdown tu API
-            if (data.models && data.models.length > 0) {
+            if (primaryData.models && primaryData.models.length > 0) {
                 const modelSelect = dom.modelSelect;
                 const currentVal = modelSelect.value;
                 modelSelect.innerHTML = '';
                 
                 // Prefer the full Flash model for long-form story coherence.
                 const preferred = ['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
-                const sorted = data.models.sort((a, b) => {
+                const sorted = primaryData.models.sort((a, b) => {
                     const aIdx = preferred.indexOf(a);
                     const bIdx = preferred.indexOf(b);
                     if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
@@ -352,13 +481,12 @@ async function verifyApiKey(showSuccessToast = true) {
             }
             
             checkNextStep1Availability();
-        } else {
-            updateAPIIndicator(false);
-            showToast(data.message, 'error');
+            return true;
         }
     } catch (err) {
         updateAPIIndicator(false);
         showToast('Không thể kết nối đến máy chủ backend.', 'error');
+        return false;
     } finally {
         dom.btnVerifyApi.disabled = false;
         dom.btnVerifyApi.innerHTML = '<i class="fa-solid fa-circle-check"></i> Xác Thực Kết Nối API';
@@ -367,6 +495,7 @@ async function verifyApiKey(showSuccessToast = true) {
 
 async function loadVideosList() {
     try {
+        const previousVideo = state.selectedVideo || dom.videoSelect.value;
         const res = await fetch('/api/list-videos');
         const list = await res.json();
         
@@ -378,10 +507,12 @@ async function loadVideosList() {
             dom.videoSelect.appendChild(opt);
         });
         
-        // Chọn sẵn video_goc.mp4 nếu có
-        if (list.includes('video_goc.mp4')) {
-            dom.videoSelect.value = 'video_goc.mp4';
-            resetProjectData('video_goc.mp4');
+        const automaticVideo = list.includes(previousVideo)
+            ? previousVideo
+            : (list.length === 1 ? list[0] : (list.includes('video_goc.mp4') ? 'video_goc.mp4' : ''));
+        if (automaticVideo) {
+            dom.videoSelect.value = automaticVideo;
+            if (automaticVideo !== state.selectedVideo) resetProjectData(automaticVideo);
             checkNextStep1Availability();
         }
     } catch (err) {
@@ -490,15 +621,35 @@ async function loadSfxList() {
 }
 
 function checkNextStep1Availability() {
-    const isApiOk = dom.apiStatusBadge.querySelector('.indicator').classList.contains('green');
-    const isVideoOk = dom.videoSelect.value !== '';
-    
-    if (isApiOk && isVideoOk) {
-        dom.btnToStep2.disabled = false;
+    const isReady = state.apiVerified && Boolean(dom.videoSelect.value);
+    dom.btnToStep2.disabled = false;
+    dom.btnToStep2.setAttribute('aria-disabled', isReady ? 'false' : 'true');
+    dom.btnToStep2.classList.toggle('is-ready', isReady);
+    if (isReady) {
         enableStep(2);
-    } else {
-        dom.btnToStep2.disabled = true;
     }
+}
+
+async function continueToScriptStep() {
+    const selectedVideo = dom.videoSelect.value;
+    if (!selectedVideo) {
+        showToast('Hãy chọn video trong danh sách hoặc tải video mới lên trước.', 'error');
+        dom.videoSelect.focus();
+        return;
+    }
+    if (!dom.apiKeyInput.value.trim()) {
+        showToast('Hãy nhập API Key Gemini trước.', 'error');
+        dom.apiKeyInput.focus();
+        return;
+    }
+    if (!state.apiVerified) {
+        const verified = await verifyApiKey(false);
+        if (!verified) return;
+    }
+    if (selectedVideo !== state.selectedVideo) resetProjectData(selectedVideo);
+    state.selectedVideo = selectedVideo;
+    enableStep(2);
+    switchPanel(2);
 }
 
 // =====================================================================
@@ -559,7 +710,8 @@ function handleFileUpload(file, progressBox, type, callback) {
         if (xhr.status === 200) {
             const res = JSON.parse(xhr.responseText);
             if (res.success) {
-                showToast(`Tải lên tệp '${file.name}' thành công!`, 'success');
+                const renameNote = res.renamed ? ` (dã dổi tên: ${res.filename})` : '';
+                showToast(`Tải lên tệp '${file.name}' thành công!${renameNote}`, 'success');
                 callback(res.filename);
             } else {
                 showToast(res.message, 'error');
@@ -581,7 +733,13 @@ function handleFileUpload(file, progressBox, type, callback) {
 // STEP 2: AI SCRIPT GENERATOR
 // =====================================================================
 async function generateScript() {
-    state.apiKey = dom.apiKeyInput.value.trim();
+    const apiKeys = collectApiKeys();
+    if (apiKeys === null) {
+        showToast(dom.apiKeysInlineError.textContent || 'Danh sách API không hợp lệ.', 'error');
+        return;
+    }
+    state.apiKeys = apiKeys || [];
+    state.apiKey = state.apiKeys[0] || '';
     const requestedVideo = dom.videoSelect.value;
     // Every Gemini generation is a new isolated project, even for the same file.
     resetProjectData(requestedVideo);
@@ -615,12 +773,12 @@ async function generateScript() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 api_key: state.apiKey,
+                api_keys: state.apiKeys,
                 model_name: state.modelName,
                 video_name: state.selectedVideo,
                 project_id: requestedProjectId,
                 style: style,
                 custom_prompt: customPromptText,
-                analysis_passes: Number(document.getElementById('analysis-passes')?.value || 2),
                 enable_multi_voice: document.getElementById('enable-multi-voice') ? document.getElementById('enable-multi-voice').checked : false
             })
         });
@@ -693,7 +851,17 @@ async function autoSplitScript() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: scriptToSplit })
         });
-        const sentences = await res.json();
+        const payload = await res.json();
+        if (!res.ok) {
+            throw new Error(payload.message || `HTTP ${res.status}`);
+        }
+        if (!Array.isArray(payload)) {
+            throw new Error('Máy chủ trả dữ liệu phân đoạn không đúng định dạng.');
+        }
+        const sentences = payload.filter(item => typeof item === 'string' && item.trim());
+        if (sentences.length === 0) {
+            throw new Error('Kịch bản không tạo được phân đoạn hợp lệ.');
+        }
         if (state.projectId !== state.scriptProjectId || dom.scriptEditor.value.trim() !== scriptToSplit) return;
         state.sentences = sentences;
         state.splitScriptSnapshot = scriptToSplit;
@@ -701,7 +869,12 @@ async function autoSplitScript() {
         updateSentenceStats();
         enableStep(4);
     } catch (err) {
-        dom.sentencesList.innerHTML = '<div class="text-red p-3">Lỗi khi phân đoạn câu.</div>';
+        const message = err && err.message ? err.message : 'Lỗi không xác định';
+        dom.sentencesList.innerHTML = '';
+        const errorBox = document.createElement('div');
+        errorBox.className = 'text-red p-3';
+        errorBox.textContent = `Lỗi khi phân đoạn câu: ${message}`;
+        dom.sentencesList.appendChild(errorBox);
     }
 }
 
@@ -1168,16 +1341,39 @@ function setupEventListeners() {
     // Toggle hiển thị API Key
     dom.btnToggleApiKey.addEventListener('click', () => {
         const type = dom.apiKeyInput.type === 'password' ? 'text' : 'password';
-        dom.apiKeyInput.type = type;
+        [dom.apiKeyInput, dom.apiKeyInput2, dom.apiKeyInput3].forEach(input => {
+            if (input) input.type = type;
+        });
         dom.btnToggleApiKey.querySelector('i').className = type === 'password' ? 'fa-solid fa-eye' : 'fa-solid fa-eye-slash';
     });
-    
+
+    dom.btnExpandApiKeys.addEventListener('click', () => {
+        const expanded = dom.btnExpandApiKeys.getAttribute('aria-expanded') === 'true';
+        setAdditionalApiKeysExpanded(!expanded);
+        if (!expanded && dom.apiKeyInput2 && !dom.apiKeyInput2.value) {
+            dom.apiKeyInput2.focus();
+        }
+    });
+
+    dom.apiPriorityButtons.forEach(button => {
+        button.addEventListener('click', () => {
+            prioritizeApiSlot(Number(button.dataset.apiSlot));
+        });
+    });
+
     // API verification button
     dom.btnVerifyApi.addEventListener('click', () => verifyApiKey(true));
     
     // Check key on text input change
-    dom.apiKeyInput.addEventListener('input', () => {
-        checkNextStep1Availability();
+    [dom.apiKeyInput, dom.apiKeyInput2, dom.apiKeyInput3].forEach(input => {
+        if (!input) return;
+        input.addEventListener('input', () => {
+            const currentKeys = collectApiKeys();
+            if (!currentKeys || JSON.stringify(currentKeys) !== JSON.stringify(state.apiKeys)) {
+                updateAPIIndicator(false);
+            }
+            checkNextStep1Availability();
+        });
     });
     
     // Select video input change
@@ -1199,7 +1395,7 @@ function setupEventListeners() {
     });
     
     // Button Step 1 -> Step 2
-    dom.btnToStep2.addEventListener('click', () => switchPanel(2));
+    dom.btnToStep2.addEventListener('click', continueToScriptStep);
     
     // AI Scriptwriter Button
     dom.btnGenerateScript.addEventListener('click', generateScript);

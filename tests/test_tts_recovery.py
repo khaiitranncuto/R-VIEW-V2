@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import time
 import unittest
 from unittest import mock
 
@@ -8,6 +9,47 @@ import tts_engine
 
 
 class TtsRecoveryQueueTests(unittest.TestCase):
+    def test_request_pacer_spaces_parallel_starts(self):
+        async def collect_starts():
+            pacer = tts_engine._TtsRequestPacer(0.02)
+            starts = []
+
+            async def one_request():
+                await pacer.wait_turn()
+                starts.append(time.monotonic())
+
+            await asyncio.gather(*(one_request() for _ in range(3)))
+            return starts
+
+        starts = asyncio.run(collect_starts())
+        gaps = [right - left for left, right in zip(starts, starts[1:])]
+        self.assertTrue(all(gap >= 0.015 for gap in gaps), gaps)
+
+    def test_failed_group_falls_back_to_short_sentence_pieces(self):
+        failure = RuntimeError("temporary failure")
+        failed = [(4, ("voice-a", [(10, "Mot cau dai can chia nho de thu lai")]), failure)]
+        expected = (4, [(10, "TTS", "split.mp3", None, 1.25)], None)
+
+        with (
+            mock.patch.object(tts_engine, "TTS_RECOVERY_DELAYS", (0.0,)),
+            mock.patch.object(tts_engine, "_invalidate_tts_group_cache", return_value=True),
+            mock.patch.object(tts_engine, "process_tts_group", side_effect=failure),
+            mock.patch.object(
+                tts_engine,
+                "_recover_tts_group_as_short_pieces",
+                return_value=expected,
+            ) as split_mock,
+        ):
+            recovered, pending, _ = asyncio.run(
+                tts_engine._recover_failed_tts_groups(
+                    failed, "+0%", "temp", "ffmpeg", None
+                )
+            )
+
+        self.assertEqual(recovered, [expected])
+        self.assertEqual(pending, [])
+        split_mock.assert_awaited_once()
+
     def test_recovery_retries_only_failed_group_and_keeps_index(self):
         failure = RuntimeError("temporary failure")
         failed = [(4, ("voice-a", [(10, "Cau thu muoi mot")]), failure)]

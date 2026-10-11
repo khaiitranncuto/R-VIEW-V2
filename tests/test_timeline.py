@@ -6,26 +6,37 @@ from tts_engine import (
     TTS_REQUEST_TIMEOUT,
     TTS_RETRY_DELAYS,
     _build_tts_groups,
+    _cue_partitions,
+    _word_locked_beat_boundaries,
     _split_long_tts_text,
     _tts_cache_paths,
     format_timeline_rows,
     expand_visual_beats,
     parse_sentences_and_visual_beats,
-    parse_sentences_and_time_ranges,
-    parse_sentences_and_timestamps,
     remove_non_story_timeline_rows,
     split_text_into_sentences,
 )
 from video_renderer import (
     _pause_duration_for_text,
+    _quantize_durations_to_frames,
     _remove_voice_control_rows,
     _require_exact_audio_alignment,
+    build_shot_spans,
     build_visual_edit_plan,
     fit_tts_to_time_ranges,
 )
+from scene_matcher import ADAPTIVE_SEARCH_WINDOWS
 
 
 class TimelineParsingTests(unittest.TestCase):
+    def test_scene_search_expands_in_small_steps_to_ten_seconds(self):
+        self.assertEqual(ADAPTIVE_SEARCH_WINDOWS, (3.0, 5.0, 10.0))
+
+    def test_missing_word_cues_never_create_out_of_range_partitions(self):
+        partitions = _cue_partitions([object(), object()], ["one", "two", "three", "four"])
+        self.assertEqual(len(partitions), 4)
+        self.assertTrue(all(0 <= start <= end <= 2 for start, end in partitions))
+
     def test_each_timestamp_is_formatted_as_one_row(self):
         source = (
             "[TIME=00:12] Câu thứ nhất. [TIME=00:36] "
@@ -39,23 +50,6 @@ class TimelineParsingTests(unittest.TestCase):
             ],
         )
 
-    def test_every_action_inherits_its_timeline_anchor(self):
-        source = (
-            "[TIME=01:57] Con rắn xuất hiện, lao tới và cuốn lấy hai người."
-        )
-        sentences = split_text_into_sentences(source)
-        clean, timestamps = parse_sentences_and_timestamps(sentences)
-        self.assertEqual(timestamps, [117, 117, 117])
-        self.assertEqual(
-            clean,
-            ["Con rắn xuất hiện", "lao tới", "và cuốn lấy hai người."],
-        )
-
-    def test_multiple_sentences_keep_the_same_anchor(self):
-        source = "[TIME=00:10] Chuột chạy đi. Ếch lập tức đuổi theo."
-        _, timestamps = parse_sentences_and_timestamps(split_text_into_sentences(source))
-        self.assertEqual(timestamps, [10, 10])
-
     def test_logo_and_credit_rows_are_removed(self):
         source = (
             "[TIME=00:01] Logo hãng phim xuất hiện.\n"
@@ -67,70 +61,12 @@ class TimelineParsingTests(unittest.TestCase):
             "[TIME=00:12] Chú chuột bước ra khỏi nhà.",
         )
 
-    def test_start_end_ranges_are_preserved_and_parsed(self):
-        source = (
-            "[TIME=01:36-01:51] Chuột kể chiến tích. "
-            "[TIME=01:51-01:57] Chuột tiếp tục khoe khoang."
-        )
-        formatted = format_timeline_rows(source)
-        sentences = split_text_into_sentences(formatted)
-        clean, starts, ends = parse_sentences_and_time_ranges(sentences)
-        self.assertEqual(clean, ["Chuột kể chiến tích.", "Chuột tiếp tục khoe khoang."])
-        self.assertEqual(starts, [96, 111])
-        self.assertEqual(ends, [111, 117])
-
-    def test_minute_timestamps_above_99_are_not_collapsed(self):
-        source = (
-            "[TIME=99:55-100:05] Cau truoc. "
-            "[TIME=100:05-100:15] Cau sau."
-        )
-        rows = split_text_into_sentences(source)
-        clean, starts, ends = parse_sentences_and_time_ranges(rows)
-        self.assertEqual(clean, ["Cau truoc.", "Cau sau."])
-        self.assertEqual(starts, [5995, 6005])
-        self.assertEqual(ends, [6005, 6015])
-
-    def test_fractional_shot_timestamps_are_preserved(self):
-        rows = split_text_into_sentences(
-            "[TIME=00:03.50-00:04.50] Mot shot ngan chinh xac."
-        )
-        clean, starts, ends = parse_sentences_and_time_ranges(rows)
-        self.assertEqual(clean, ["Mot shot ngan chinh xac."])
-        self.assertEqual(starts, [3.5])
-        self.assertEqual(ends, [4.5])
-
     def test_oversized_tts_is_split_at_safe_boundaries(self):
         text = ("Mot cau ke tu nhien, " * 100).strip()
         pieces = _split_long_tts_text(text, max_chars=200)
         self.assertGreater(len(pieces), 1)
         self.assertTrue(all(0 < len(piece) <= 200 for piece in pieces))
         self.assertEqual(" ".join(pieces), text)
-
-    def test_explicit_range_is_not_split_from_action_words(self):
-        source = (
-            "[TIME=02:03-02:14] Con rắn xuất hiện. "
-            "Nó lao tới và cuốn lấy cả hai người."
-        )
-        sentences = split_text_into_sentences(source)
-        self.assertEqual(len(sentences), 1)
-        clean, starts, ends = parse_sentences_and_time_ranges(sentences)
-        self.assertEqual(
-            clean,
-            ["Con rắn xuất hiện. Nó lao tới và cuốn lấy cả hai người."],
-        )
-        self.assertEqual(starts, [123])
-        self.assertEqual(ends, [134])
-
-    def test_locked_range_keeps_complete_natural_sentence(self):
-        source = (
-            "[TIME=00:10-00:19] Anh mở cửa. "
-            "Sau đó anh chạy ra ngoài. Cuối cùng anh nhảy xuống nước."
-        )
-        sentences = split_text_into_sentences(source)
-        _, starts, ends = parse_sentences_and_time_ranges(sentences)
-        self.assertEqual(len(sentences), 1)
-        self.assertEqual(starts, [10])
-        self.assertEqual(ends, [19])
 
     def test_inline_visual_beats_keep_one_natural_tts_sentence(self):
         source = (
@@ -215,10 +151,46 @@ class TimelineParsingTests(unittest.TestCase):
         self.assertEqual(starts, [80, 87])
         self.assertEqual(ends, [84, 91])
 
+    def test_visual_beat_cut_is_locked_to_trigger_word_with_small_lead(self):
+        beats = [
+            {"text": "John mo cua buoc vao,"},
+            {"text": "nguoi dan ong lap tuc rut sung."},
+        ]
+        cues = [
+            {"start": 0.0, "end": 0.3, "content": "John"},
+            {"start": 0.3, "end": 0.6, "content": "mo"},
+            {"start": 0.6, "end": 0.9, "content": "cua"},
+            {"start": 0.9, "end": 1.2, "content": "buoc"},
+            {"start": 1.2, "end": 1.5, "content": "vao"},
+            {"start": 1.8, "end": 2.1, "content": "nguoi"},
+            {"start": 2.1, "end": 2.4, "content": "dan"},
+            {"start": 2.4, "end": 2.7, "content": "ong"},
+            {"start": 2.7, "end": 3.1, "content": "lap tuc rut sung"},
+        ]
+        boundaries = _word_locked_beat_boundaries(beats, cues, 3.1)
+        self.assertAlmostEqual(boundaries[1], 1.7)
+
+    def test_visual_beat_alignment_falls_back_when_trigger_is_missing(self):
+        beats = [{"text": "canh mot"}, {"text": "cum khong ton tai"}]
+        cues = [
+            {"start": 0.0, "end": 0.5, "content": "canh"},
+            {"start": 0.5, "end": 1.0, "content": "mot"},
+        ]
+        self.assertIsNone(_word_locked_beat_boundaries(beats, cues, 1.0))
+
     def test_tts_groups_adjacent_beats_but_respects_voice_changes(self):
-        sentences = ["Cau mot.", "Cau hai.", "Cau ba."]
+        sentences = ["Cau mot.", "Nhung cau hai tiep noi.", "Cau ba."]
         groups = _build_tts_groups(sentences, ["voice-a", "voice-a", "voice-b"])
         self.assertEqual([len(items) for _, items in groups], [2, 1])
+
+    def test_tts_batches_four_consecutive_sentences_even_after_full_stops(self):
+        sentences = [f"Cau thu {index}." for index in range(6)]
+        groups = _build_tts_groups(sentences, ["voice-a"] * len(sentences))
+        self.assertEqual([len(items) for _, items in groups], [4, 2])
+        self.assertEqual(
+            [index for _, items in groups for index, _ in items],
+            list(range(6)),
+        )
 
     def test_long_video_tts_retry_policy(self):
         self.assertEqual(MAX_TTS_RETRIES, 3)
@@ -253,7 +225,7 @@ class TimelineParsingTests(unittest.TestCase):
         self.assertEqual(durations, [6.0])
         self.assertFalse(adjusted)
 
-    def test_audio_led_edl_keeps_each_gemini_anchor_independent(self):
+    def test_locked_start_is_not_pushed_by_previous_narration_overrun(self):
         plan = build_visual_edit_plan(
             durations=[6.0, 4.0],
             starts=[10.0, 15.0],
@@ -262,7 +234,86 @@ class TimelineParsingTests(unittest.TestCase):
         )
         self.assertEqual(plan[0]["source_start"], 10.0)
         self.assertEqual(plan[1]["source_start"], 15.0)
-        self.assertLessEqual(plan[0]["source_start"] + plan[0]["source_duration"], 15.0)
+        self.assertEqual(plan[0]["source_duration"], 5.0)
+        self.assertEqual(plan[0]["hold_duration"], 1.0)
+        self.assertEqual(plan[0]["playback_speed"], 1.0)
+
+    def test_audio_overflow_extends_end_when_gap_before_next_action_is_available(self):
+        plan = build_visual_edit_plan(
+            durations=[6.0, 4.0],
+            starts=[10.0, 18.0],
+            ends=[14.0, 22.0],
+            video_duration=100.0,
+        )
+        self.assertEqual(plan[0]["source_start"], 10.0)
+        self.assertEqual(plan[0]["source_duration"], 6.0)
+        self.assertEqual(plan[0]["extended_by"], 2.0)
+        self.assertEqual(plan[0]["hold_duration"], 0.0)
+        self.assertEqual(plan[0]["playback_speed"], 1.0)
+
+    def test_locked_range_counts_all_natural_shots_without_extra_clip_files(self):
+        scenes = [
+            {"start": 0.0, "end": 11.5},
+            {"start": 11.5, "end": 13.0},
+            {"start": 13.0, "end": 18.0},
+            {"start": 18.0, "end": 30.0},
+        ]
+        plan = build_visual_edit_plan(
+            durations=[6.0],
+            starts=[10.0],
+            ends=[14.0],
+            video_duration=100.0,
+            scenes=scenes,
+        )
+        self.assertEqual(plan[0]["source_start"], 10.0)
+        self.assertEqual(plan[0]["source_duration"], 6.0)
+        self.assertEqual(plan[0]["extended_by"], 2.0)
+        self.assertEqual(plan[0]["shot_count"], 3)
+
+    def test_shot_selector_spreads_visuals_across_complete_locked_time(self):
+        scenes = [
+            {"start": 0.0, "end": 2.0},
+            {"start": 2.0, "end": 4.0},
+            {"start": 4.0, "end": 6.0},
+            {"start": 6.0, "end": 8.0},
+        ]
+        plan = build_visual_edit_plan(
+            durations=[6.0], starts=[0.0], ends=[8.0],
+            video_duration=20.0, scenes=scenes,
+        )
+        spans = build_shot_spans(plan[0], scenes)
+        self.assertEqual(len(spans), 3)
+        self.assertAlmostEqual(sum(duration for _, duration in spans), 6.0)
+        self.assertEqual(spans, sorted(spans))
+        self.assertGreaterEqual(spans[0][0], 0.0)
+        self.assertLessEqual(spans[-1][0] + spans[-1][1], 8.0)
+        self.assertGreaterEqual(spans[-1][0], 6.0)
+
+    def test_shot_selector_uses_bounded_end_extension_for_long_tts(self):
+        scenes = [
+            {"start": 0.0, "end": 2.0},
+            {"start": 2.0, "end": 4.0},
+            {"start": 4.0, "end": 6.0},
+            {"start": 6.0, "end": 8.0},
+            {"start": 8.0, "end": 10.0},
+        ]
+        plan = build_visual_edit_plan(
+            durations=[8.0, 2.0], starts=[0.0, 10.0], ends=[4.0, 12.0],
+            video_duration=20.0, scenes=scenes,
+        )
+        spans = build_shot_spans(plan[0], scenes)
+        self.assertEqual(plan[0]["visual_window_end"], 8.0)
+        self.assertAlmostEqual(sum(duration for _, duration in spans), 8.0)
+        self.assertLessEqual(max(start + duration for start, duration in spans), 8.0)
+
+    def test_locked_starts_do_not_accumulate_drift(self):
+        plan = build_visual_edit_plan(
+            durations=[8.0, 8.0, 8.0],
+            starts=[10.0, 15.0, 20.0],
+            ends=[15.0, 20.0, 25.0],
+            video_duration=100.0,
+        )
+        self.assertEqual([item["source_start"] for item in plan], [10.0, 15.0, 20.0])
 
     def test_audio_led_edl_uses_real_frames_at_source_end(self):
         plan = build_visual_edit_plan(
@@ -271,10 +322,11 @@ class TimelineParsingTests(unittest.TestCase):
             ends=[100.0],
             video_duration=100.0,
         )
+        self.assertEqual(plan[0]["source_start"], 98.0)
         self.assertAlmostEqual(plan[0]["source_start"] + plan[0]["source_duration"], 100.0)
-        self.assertGreater(plan[0]["source_duration"], 0.0)
+        self.assertEqual(plan[0]["hold_duration"], 4.0)
 
-    def test_locked_range_never_borrows_frames_from_neighbouring_action(self):
+    def test_last_locked_range_extends_over_real_source_footage(self):
         plan = build_visual_edit_plan(
             durations=[10.0],
             starts=[20.0],
@@ -282,8 +334,25 @@ class TimelineParsingTests(unittest.TestCase):
             video_duration=100.0,
         )
         self.assertEqual(plan[0]["source_start"], 20.0)
-        self.assertEqual(plan[0]["source_duration"], 4.0)
-        self.assertAlmostEqual(plan[0]["playback_speed"], 0.4)
+        self.assertEqual(plan[0]["source_duration"], 10.0)
+        self.assertEqual(plan[0]["extended_by"], 6.0)
+        self.assertEqual(plan[0]["hold_duration"], 0.0)
+        self.assertAlmostEqual(plan[0]["playback_speed"], 1.0)
+
+    def test_frame_rounding_uses_cumulative_clock_without_drift(self):
+        durations = [0.05] * 20
+        quantized = _quantize_durations_to_frames(durations, fps=30)
+        self.assertAlmostEqual(sum(quantized), round(sum(durations) * 30) / 30)
+
+    def test_short_audio_uses_only_needed_source_frames_at_normal_speed(self):
+        plan = build_visual_edit_plan(
+            durations=[8.0],
+            starts=[20.0],
+            ends=[32.0],
+            video_duration=100.0,
+        )
+        self.assertEqual(plan[0]["source_duration"], 8.0)
+        self.assertAlmostEqual(plan[0]["playback_speed"], 1.0)
 
     def test_audio_led_edl_uses_interpolation_for_missing_anchor(self):
         plan = build_visual_edit_plan(
